@@ -1,0 +1,9 @@
+# PyTorch is intentionally not listed here. The target machine already provides
+# torch 2.11.0+cu130; installing this file must not replace that CUDA build.
+dpkt>=1.9.8
+numpy>=1.26
+PyYAML>=6.0
+tensorboard>=2.16
+tqdm>=4.66
+pytest>=8.0
+

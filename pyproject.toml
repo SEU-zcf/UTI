@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uti-mpc"
+version = "0.1.0"
+description = "Reproduction of UTI-MPC for unknown encrypted traffic identification"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "dpkt>=1.9.8",
+  "numpy>=1.26",
+  "PyYAML>=6.0",
+  "tensorboard>=2.16",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+

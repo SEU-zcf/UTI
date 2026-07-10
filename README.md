@@ -1,0 +1,106 @@
+# UTI-MPC
+
+PyTorch reproduction of **UTI-MPC: A Multi-View Contrastive Learning Method for Unknown Encrypted Traffic Detection**.
+
+The implementation preserves the paper's BGI-CNN byte branch, TWT length-direction branch, adaptive modality gate, unit-sphere embedding, two-stage ProtoMargin objective, and class-specific 95th-percentile rejection thresholds.
+
+## Environment
+
+The target environment is Python 3.12.3 with an existing `torch 2.11.0+cu130` installation. Install this project without replacing that CUDA build:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install --no-build-isolation -e . --no-deps
+```
+
+Verify the supplied PyTorch installation separately:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+## Single-H200 rule
+
+This project deliberately does not implement DDP or DataParallel. Select exactly one physical H200 before starting Python:
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python -m uti_mpc.train --config configs/iscxvpn2016_ur40.yaml
+```
+
+Inside the process, the selected card is always logical `cuda:0`. The code never enumerates or initializes the other seven cards. The default precision is BF16 and the fixed training batch is `P=4, Q=32` (128 flows).
+
+## Expected raw data layout
+
+Place ISCXVPN2016 PCAP or PCAPNG captures under one root directory. Labels are inferred conservatively from capture paths. For non-standard names, supply a CSV instead of relying on inference:
+
+```csv
+path,label
+NonVPN/aim_chat_3a.pcap,Chat
+VPN/vpn_ftps_A.pcap,VPN-FileTransfer
+custom/capture.pcap,10
+```
+
+Both numeric IDs and the following names are accepted:
+
+| ID | Class | ID | Class |
+|---:|---|---:|---|
+| 1 | Chat | 6 | VPN-Chat |
+| 2 | Email | 7 | VPN-Email |
+| 3 | FileTransfer | 8 | VPN-FileTransfer |
+| 4 | Streaming | 9 | VPN-Streaming |
+| 5 | VoIP | 10 | VPN-VoIP |
+
+## Preprocessing
+
+One preprocessing pass can be reused by all three unknown-ratio experiments:
+
+```bash
+python -m uti_mpc.preprocess \
+  --config configs/iscxvpn2016_ur40.yaml \
+  --pcap-root /path/to/ISCXVPN2016/PCAPs \
+  --label-map /path/to/labels.csv
+```
+
+The cache defaults to `data/processed/iscxvpn2016`. It contains memory-mapped NumPy shards and `manifest.json`. Processing keeps IPv4 TCP/UDP flows only, aggregates bidirectional five-tuples with a 60-second idle timeout, and records one label per capture.
+
+## Training
+
+Run each paper split independently:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.train --config configs/iscxvpn2016_ur20.yaml
+CUDA_VISIBLE_DEVICES=1 python -m uti_mpc.train --config configs/iscxvpn2016_ur40.yaml
+CUDA_VISIBLE_DEVICES=2 python -m uti_mpc.train --config configs/iscxvpn2016_ur60.yaml
+```
+
+These are three independent single-GPU processes. A single training process always uses only one selected card.
+
+Resume without changing the configuration:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.train \
+  --config configs/iscxvpn2016_ur20.yaml \
+  --resume outputs/iscxvpn2016_ur20/last.pt
+```
+
+Each output directory contains the resolved configuration, deterministic split, TensorBoard logs, JSONL training log, `last.pt`, and `best.pt`.
+
+## Calibration and evaluation
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.evaluate \
+  --config configs/iscxvpn2016_ur20.yaml \
+  --checkpoint outputs/iscxvpn2016_ur20/best.pt
+```
+
+The evaluation directory contains prototypes and thresholds, PR/KCA/UDR, confusion matrix, and per-flow predictions. Unknown traffic is represented by prediction `-1`.
+
+## CPU smoke tests
+
+CPU mode is intended for verification, not full training. Tests override the CUDA/BF16 settings with a small synthetic configuration:
+
+```bash
+pytest
+```
+
+The tests cover packet feature construction, bidirectional flow aggregation, deterministic open-set splits, model shapes and gradients, ProtoMargin, adaptive thresholds, metrics, checkpointing, and a one-epoch end-to-end run.

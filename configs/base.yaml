@@ -1,0 +1,55 @@
+data:
+  cache_dir: data/processed/iscxvpn2016
+  np: 64
+  nl: 32
+  idle_timeout: 60.0
+  min_packets: 1
+
+model:
+  byte_embedding_dim: 16
+  branch_channels: 32
+  byte_dim: 128
+  time_dim: 128
+  embedding_dim: 128
+  se_reduction: 8
+  attention_heads: 4
+  windows: [2, 4, 8, 16]
+  ffn_expansion: 4
+  dropout: 0.1
+  max_length: 512
+
+split:
+  test_fraction: 0.2
+  validation_fraction_of_development: 0.1
+
+loss:
+  triplet_margin: 0.2
+  prototype_margin: 1.0
+  lambda_intra: 0.5
+  lambda_inter: 0.3
+
+train:
+  seed: 42
+  device: cuda:0
+  amp: bf16
+  deterministic: true
+  compile: false
+  epochs: 100
+  stage1_epochs: 10
+  classes_per_batch: 4
+  samples_per_class: 32
+  batches_per_epoch: null
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  gradient_clip: 1.0
+  evaluate_every: 5
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+evaluation:
+  batch_size: 512
+  threshold_quantile: 0.95
+

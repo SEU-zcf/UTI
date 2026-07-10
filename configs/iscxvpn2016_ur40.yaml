@@ -1,0 +1,7 @@
+extends: base.yaml
+split:
+  known_classes: [1, 3, 5, 6, 8, 10]
+  unknown_classes: [2, 4, 7, 9]
+train:
+  output_dir: outputs/iscxvpn2016_ur40
+
