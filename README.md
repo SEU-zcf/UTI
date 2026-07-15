@@ -118,6 +118,8 @@ It also contains `raw_class_confusion.csv`, which preserves the original labels
 of unknown classes rather than merging them into one row, and
 `class_distance_diagnostics.json`, with per-class acceptance, nearest-prototype,
 distance, and threshold-ratio distributions.
+`capture_prediction_breakdown.csv` further aggregates these diagnostics by source
+PCAP capture, preserving the original class and final prediction.
 
 ## CPU smoke tests
 

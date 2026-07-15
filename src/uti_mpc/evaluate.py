@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -23,6 +24,57 @@ from uti_mpc.metrics.open_set import (
 )
 from uti_mpc.models import UTIMPC
 from uti_mpc.utils import atomic_torch_save, choose_amp_dtype, seed_everything, select_single_device
+
+
+def _capture_prediction_breakdown(
+    flow_ids: list[str],
+    captures_by_shard: dict[str, str],
+    targets: torch.Tensor,
+    predictions: torch.Tensor,
+    nearest_classes: torch.Tensor,
+    nearest_distances: torch.Tensor,
+    threshold_ratios: torch.Tensor,
+) -> tuple[list[str], list[dict[str, float | int | str]]]:
+    """Attach flow predictions to source captures and aggregate diagnostic rows."""
+    captures: list[str] = []
+    grouped: dict[tuple[str, int, int, int], list[tuple[float, float]]] = defaultdict(list)
+    for flow_id, target, prediction, nearest, distance, ratio in zip(
+        flow_ids,
+        targets.tolist(),
+        predictions.tolist(),
+        nearest_classes.tolist(),
+        nearest_distances.tolist(),
+        threshold_ratios.tolist(),
+        strict=True,
+    ):
+        shard_id, separator, _ = flow_id.rpartition(":")
+        if not separator or shard_id not in captures_by_shard:
+            raise RuntimeError(f"Cannot resolve source capture for flow ID: {flow_id}")
+        capture = captures_by_shard[shard_id]
+        captures.append(capture)
+        grouped[(capture, int(target), int(nearest), int(prediction))].append(
+            (float(distance), float(ratio))
+        )
+
+    rows: list[dict[str, float | int | str]] = []
+    for (capture, target, nearest, prediction), values in sorted(grouped.items()):
+        distances = torch.tensor([value[0] for value in values], dtype=torch.float32)
+        ratios = torch.tensor([value[1] for value in values], dtype=torch.float32)
+        rows.append(
+            {
+                "capture": capture,
+                "target": target,
+                "target_name": ISCXVPN2016_CLASSES.get(target, "unknown"),
+                "nearest_prototype": nearest,
+                "prediction": prediction,
+                "count": len(values),
+                "mean_nearest_squared_distance": float(distances.mean()),
+                "median_nearest_squared_distance": float(distances.median()),
+                "mean_threshold_ratio": float(ratios.mean()),
+                "median_threshold_ratio": float(ratios.median()),
+            }
+        )
+    return captures, rows
 
 
 def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
@@ -73,6 +125,20 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
         raw_target_order,
         order,
     )
+    # ``capture`` is present in current preprocessing manifests.  The fallback
+    # keeps legacy caches and minimal synthetic manifests evaluable.
+    captures_by_shard = {
+        str(shard["id"]): str(shard.get("capture", shard["id"])) for shard in dataset.shards
+    }
+    captures, capture_breakdown = _capture_prediction_breakdown(
+        flow_ids,
+        captures_by_shard,
+        test_labels,
+        predictions,
+        nearest_classes,
+        nearest_distances,
+        threshold_ratios,
+    )
     result_dir = output_dir / "evaluation"
     result_dir.mkdir(parents=True, exist_ok=True)
     atomic_torch_save(artifacts, result_dir / "open_set_artifacts.pt")
@@ -118,11 +184,32 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
             indent=2,
             ensure_ascii=False,
         )
+    with (result_dir / "capture_prediction_breakdown.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "capture",
+                "target",
+                "target_name",
+                "nearest_prototype",
+                "prediction",
+                "count",
+                "mean_nearest_squared_distance",
+                "median_nearest_squared_distance",
+                "mean_threshold_ratio",
+                "median_threshold_ratio",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(capture_breakdown)
     with (result_dir / "predictions.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(
             [
                 "flow_id",
+                "capture",
                 "target",
                 "prediction",
                 "nearest_prototype",
@@ -131,8 +218,9 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
                 "threshold_ratio",
             ]
         )
-        for flow_id, target, prediction, nearest_class, distance, threshold, ratio in zip(
+        for flow_id, capture, target, prediction, nearest_class, distance, threshold, ratio in zip(
             flow_ids,
+            captures,
             test_labels.tolist(),
             predictions.tolist(),
             nearest_classes.tolist(),
@@ -141,7 +229,9 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
             threshold_ratios.tolist(),
             strict=True,
         ):
-            writer.writerow([flow_id, target, prediction, nearest_class, distance, threshold, ratio])
+            writer.writerow(
+                [flow_id, capture, target, prediction, nearest_class, distance, threshold, ratio]
+            )
     print(json.dumps(serializable, indent=2, ensure_ascii=False))
     return serializable
 
