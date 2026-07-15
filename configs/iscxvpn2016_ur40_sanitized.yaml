@@ -17,3 +17,8 @@ evaluation:
   threshold_quantile: 0.95
   minimum_threshold_samples: 5
   use_train_threshold_floor: true
+  compare_auxiliary_rejection: true
+  auxiliary_threshold_quantile: 0.95
+  minimum_auxiliary_threshold_samples: 5
+  knn_neighbors: 5
+  knn_chunk_size: 1024

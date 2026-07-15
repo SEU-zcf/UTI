@@ -117,3 +117,23 @@ evaluation:
     assert metrics["threshold_source"] == "validation"
     assert metrics["length_conditioned_prototypes"] is True
     assert (output / "evaluation" / "flow_length_metrics.csv").exists()
+    assert (output / "evaluation" / "decision_mode_comparison.csv").exists()
+
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        .replace("length_conditioned_prototypes: true", "length_conditioned_prototypes: false")
+        .replace(
+            "use_train_threshold_floor: true",
+            "use_train_threshold_floor: true\n  compare_auxiliary_rejection: true\n"
+            "  auxiliary_threshold_quantile: 0.95\n  knn_neighbors: 1\n"
+            "  minimum_auxiliary_threshold_samples: 1\n  knn_chunk_size: 8",
+        ),
+        encoding="utf-8",
+    )
+    auxiliary_metrics = evaluate(config, best)
+    assert set(auxiliary_metrics["decision_mode_comparison"]) == {
+        "prototype_only",
+        "prototype_knn",
+        "prototype_knn_margin",
+    }
+    assert (output / "evaluation" / "auxiliary_predictions.csv").exists()

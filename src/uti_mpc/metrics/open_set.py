@@ -9,6 +9,112 @@ def squared_distances(features: torch.Tensor, prototypes: torch.Tensor) -> torch
     return torch.cdist(features.float(), prototypes.float(), p=2).square()
 
 
+def class_conditional_knn_scores(
+    features: torch.Tensor,
+    assigned_classes: torch.Tensor,
+    reference_features: torch.Tensor,
+    reference_labels: torch.Tensor,
+    neighbors: int = 5,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """Mean squared distance to the k nearest references of the assigned class."""
+    if neighbors < 1:
+        raise ValueError("neighbors must be at least 1")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1")
+    if len(features) != len(assigned_classes):
+        raise ValueError("features and assigned_classes must have the same length")
+    if len(reference_features) != len(reference_labels):
+        raise ValueError("reference_features and reference_labels must have the same length")
+
+    device = features.device
+    assigned_classes = assigned_classes.to(device)
+    reference_features = reference_features.to(device)
+    reference_labels = reference_labels.to(device)
+    scores = torch.empty(len(features), dtype=torch.float32, device=device)
+    for label in torch.unique(assigned_classes):
+        query_indices = torch.nonzero(assigned_classes == label, as_tuple=False).flatten()
+        references = reference_features[reference_labels == label]
+        if len(references) == 0:
+            raise ValueError(f"Assigned class {int(label)} has no kNN reference samples")
+        k = min(neighbors, len(references))
+        for start in range(0, len(query_indices), chunk_size):
+            indices = query_indices[start : start + chunk_size]
+            distances = squared_distances(features[indices], references)
+            scores[indices] = distances.topk(k, dim=1, largest=False).values.mean(dim=1)
+    return scores
+
+
+def prototype_distance_ratios(distances: torch.Tensor) -> torch.Tensor:
+    """Return nearest/second-nearest prototype distance; lower is less ambiguous."""
+    if distances.ndim != 2 or distances.shape[1] < 2:
+        raise ValueError("At least two prototype distances are required")
+    nearest_two = distances.topk(2, dim=1, largest=False).values
+    epsilon = torch.finfo(nearest_two.dtype).eps
+    return nearest_two[:, 0] / nearest_two[:, 1].clamp_min(epsilon)
+
+
+def calibrate_auxiliary_rejection(
+    validation_features: torch.Tensor,
+    validation_labels: torch.Tensor,
+    validation_distances: torch.Tensor,
+    classes: torch.Tensor,
+    reference_features: torch.Tensor,
+    reference_labels: torch.Tensor,
+    quantile: float = 0.95,
+    neighbors: int = 5,
+    minimum_calibration_samples: int = 5,
+    chunk_size: int = 1024,
+) -> dict[str, torch.Tensor]:
+    """Calibrate local-density and prototype-ambiguity rejection thresholds."""
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError("quantile must be between 0 and 1")
+    if minimum_calibration_samples < 1:
+        raise ValueError("minimum_calibration_samples must be at least 1")
+    if len(validation_features) != len(validation_labels):
+        raise ValueError("Validation features and labels must have the same length")
+    if validation_distances.shape != (len(validation_features), len(classes)):
+        raise ValueError("validation_distances has an unexpected shape")
+
+    device = validation_features.device
+    classes = classes.to(device)
+    validation_labels = validation_labels.to(device)
+    nearest_positions = validation_distances.argmin(dim=1)
+    nearest_classes = classes[nearest_positions]
+    knn_scores = class_conditional_knn_scores(
+        validation_features,
+        nearest_classes,
+        reference_features,
+        reference_labels,
+        neighbors=neighbors,
+        chunk_size=chunk_size,
+    )
+    margin_ratios = prototype_distance_ratios(validation_distances)
+    knn_thresholds = torch.full(
+        (len(classes),), torch.inf, dtype=torch.float32, device=device
+    )
+    margin_thresholds = torch.ones(len(classes), dtype=torch.float32, device=device)
+    sample_counts = torch.zeros(len(classes), dtype=torch.long, device=device)
+    source_codes = torch.zeros(len(classes), dtype=torch.long, device=device)
+    for position, label in enumerate(classes):
+        selected = (validation_labels == label) & (nearest_classes == label)
+        count = int(selected.sum())
+        sample_counts[position] = count
+        if count < minimum_calibration_samples:
+            continue
+        knn_thresholds[position] = torch.quantile(knn_scores[selected], quantile)
+        margin_thresholds[position] = torch.quantile(margin_ratios[selected], quantile)
+        source_codes[position] = 1
+    return {
+        "knn_thresholds": knn_thresholds.cpu(),
+        "margin_thresholds": margin_thresholds.cpu(),
+        "sample_counts": sample_counts.cpu(),
+        "source_codes": source_codes.cpu(),
+        "quantile": torch.tensor(quantile),
+        "neighbors": torch.tensor(neighbors),
+    }
+
+
 def compute_prototypes(
     features: torch.Tensor, labels: torch.Tensor, known_classes: Sequence[int]
 ) -> tuple[torch.Tensor, torch.Tensor]:

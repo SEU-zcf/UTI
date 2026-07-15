@@ -3,11 +3,15 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from uti_mpc.metrics.open_set import (
+    calibrate_auxiliary_rejection,
     calibrate_open_set,
+    class_conditional_knn_scores,
     class_distance_diagnostics,
     compute_open_set_metrics,
     predict_open_set,
+    prototype_distance_ratios,
     raw_confusion_matrix,
+    squared_distances,
 )
 
 
@@ -60,6 +64,42 @@ def test_validation_thresholds_keep_train_prototypes_and_record_fallback_metadat
     )
     assert torch.equal(fallback["thresholds"], fallback["train_thresholds"])
     assert fallback["threshold_source_codes"].tolist() == [0, 0]
+
+
+def test_auxiliary_rejection_uses_local_class_support_and_prototype_margin():
+    references = torch.tensor(
+        [[0.0, 0.0], [0.1, 0.0], [1.0, 1.0], [0.9, 1.0]]
+    )
+    reference_labels = torch.tensor([1, 1, 2, 2])
+    prototypes = torch.tensor([[0.05, 0.0], [0.95, 1.0]])
+    classes = torch.tensor([1, 2])
+    validation = torch.tensor([[0.04, 0.01], [0.96, 0.99]])
+    validation_labels = torch.tensor([1, 2])
+    validation_distances = squared_distances(validation, prototypes)
+    artifacts = calibrate_auxiliary_rejection(
+        validation,
+        validation_labels,
+        validation_distances,
+        classes,
+        references,
+        reference_labels,
+        quantile=0.95,
+        neighbors=1,
+        minimum_calibration_samples=1,
+    )
+    assert artifacts["source_codes"].tolist() == [1, 1]
+
+    test = torch.tensor([[0.04, 0.01], [0.5, 0.5]])
+    distances = squared_distances(test, prototypes)
+    nearest_classes = classes[distances.argmin(dim=1)]
+    knn_scores = class_conditional_knn_scores(
+        test, nearest_classes, references, reference_labels, neighbors=1
+    )
+    ratios = prototype_distance_ratios(distances)
+    threshold_positions = distances.argmin(dim=1)
+    assert knn_scores[0] <= artifacts["knn_thresholds"][threshold_positions[0]]
+    assert knn_scores[1] > artifacts["knn_thresholds"][threshold_positions[1]]
+    assert ratios[0] < ratios[1]
 
 
 def test_raw_confusion_and_distance_diagnostics_preserve_unknown_classes():

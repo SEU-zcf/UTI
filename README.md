@@ -150,6 +150,15 @@ effective source and sample count for every threshold, plus pre-rejection
 This evaluation-only change can be applied to an existing checkpoint without
 retraining.
 
+Sanitized evaluation also compares three rejection rules using the same
+checkpoint: `prototype_only`, `prototype_knn`, and
+`prototype_knn_margin`. The kNN score is the mean squared distance to the five
+nearest training embeddings of the assigned class. The margin score is the
+nearest/second-nearest prototype distance ratio. Both thresholds are calibrated
+per class from correctly classified known validation samples only. Results are
+written to `decision_mode_comparison.csv`; `auxiliary_predictions.csv` contains
+the scores, thresholds, and predictions needed for detailed error analysis.
+
 ### Flow-length conditional experiments
 
 The `*_length_conditional.yaml` configurations retain every short flow. They
