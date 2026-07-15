@@ -11,6 +11,11 @@ model:
   byte_dim: 128
   time_dim: 128
   embedding_dim: 128
+  # Baseline-compatible defaults. Enhanced experiment configs opt into deeper blocks.
+  bgi_residual_blocks: 0
+  twt_depth: 1
+  shifted_windows: false
+  fusion_residual: false
   se_reduction: 8
   attention_heads: 4
   windows: [2, 4, 8, 16]
@@ -52,4 +57,3 @@ train:
 evaluation:
   batch_size: 512
   threshold_quantile: 0.95
-

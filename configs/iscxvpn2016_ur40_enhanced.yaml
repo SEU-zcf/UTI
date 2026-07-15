@@ -1,0 +1,16 @@
+extends: iscxvpn2016_ur40.yaml
+
+# Enhanced UTI-MPC: preserve BGI-CNN/TWT/gating/ProtoMargin while increasing
+# local-context exchange and class diversity per metric-learning batch.
+model:
+  bgi_residual_blocks: 1
+  twt_depth: 2
+  shifted_windows: true
+  fusion_residual: true
+
+train:
+  output_dir: outputs/iscxvpn2016_ur40_enhanced
+  # All six known classes appear in every batch (6 x 80 = 480 flows).
+  classes_per_batch: 6
+  samples_per_class: 80
+

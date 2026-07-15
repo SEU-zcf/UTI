@@ -14,6 +14,10 @@ def _model():
             "byte_dim": 16,
             "time_dim": 16,
             "embedding_dim": 8,
+            "bgi_residual_blocks": 1,
+            "twt_depth": 2,
+            "shifted_windows": True,
+            "fusion_residual": True,
             "se_reduction": 4,
             "attention_heads": 4,
             "windows": [2, 4],
@@ -48,4 +52,3 @@ def test_protomargin_has_finite_warmup_and_formal_losses():
     assert torch.isfinite(formal["total"])
     formal["total"].backward()
     assert embeddings.grad is not None
-

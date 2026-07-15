@@ -141,6 +141,8 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
     stage1_epochs = int(config["train"]["stage1_epochs"])
     gradient_clip = float(config["train"].get("gradient_clip", 1.0))
     for epoch in range(start_epoch, epochs):
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         epoch_start = time.time()
         sampler = loaders["train"].batch_sampler
         if hasattr(sampler, "set_epoch"):
@@ -177,6 +179,8 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
             batches += 1
         if batches == 0:
             raise RuntimeError("Training loader produced no batches")
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         learning_rate = optimizer.param_groups[0]["lr"]
         scheduler.step()
         record: dict[str, Any] = {
@@ -184,8 +188,14 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
             "stage": stage,
             "learning_rate": learning_rate,
             "seconds": time.time() - epoch_start,
+            "batches": batches,
+            "batch_size": int(config["train"]["classes_per_batch"])
+            * int(config["train"]["samples_per_class"]),
             **{key: value / batches for key, value in totals.items()},
         }
+        record["samples_per_second"] = record["batches"] * record["batch_size"] / record["seconds"]
+        if device.type == "cuda":
+            record["peak_memory_gib"] = torch.cuda.max_memory_allocated(device) / (1024**3)
         should_validate = (epoch + 1) % eval_every == 0 or epoch == epochs - 1
         if should_validate:
             validation_accuracy = _known_validation_accuracy(
@@ -227,4 +237,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

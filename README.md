@@ -75,6 +75,24 @@ CUDA_VISIBLE_DEVICES=2 python -m uti_mpc.train --config configs/iscxvpn2016_ur60
 
 These are three independent single-GPU processes. A single training process always uses only one selected card.
 
+### Enhanced single-card configurations
+
+The `*_enhanced.yaml` configurations retain the paper's BGI-CNN, TWT, adaptive
+modality gate, unit-sphere embedding, and ProtoMargin pipeline. They add one
+BGI residual refinement block, a second TWT block with shifted local windows,
+and a residual path around the gated fusion transform. Their P×Q samplers cover
+every known class in each batch: UR20 uses `8×64=512`, UR40 uses `6×80=480`,
+and UR60 uses `4×128=512`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.train \
+  --config configs/iscxvpn2016_ur40_enhanced.yaml
+```
+
+These are new model structures and must start from scratch; do not resume a
+baseline checkpoint into an enhanced configuration. The enhanced output paths
+are separate, so baseline artifacts remain intact.
+
 Resume without changing the configuration:
 
 ```bash
@@ -84,6 +102,8 @@ CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.train \
 ```
 
 Each output directory contains the resolved configuration, deterministic split, TensorBoard logs, JSONL training log, `last.pt`, and `best.pt`.
+Training JSONL records also include batch count, effective batch size,
+samples/second, and peak allocated GPU memory in GiB.
 
 ## Calibration and evaluation
 

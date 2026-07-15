@@ -45,6 +45,24 @@ class SEBlock(nn.Module):
         return x + x * weights, weights.squeeze(-1).squeeze(-1)
 
 
+class ResidualConvBlock(nn.Module):
+    """A lightweight spatial refinement stage that preserves BGI-CNN dimensions."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            SamePadConv2d(channels, channels, (3, 3)),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+            SamePadConv2d(channels, channels, (3, 3)),
+            nn.BatchNorm2d(channels),
+        )
+        self.activation = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.activation(x + self.network(x))
+
+
 class BGICNN(nn.Module):
     def __init__(
         self,
@@ -52,8 +70,11 @@ class BGICNN(nn.Module):
         branch_channels: int = 32,
         output_dim: int = 128,
         se_reduction: int = 8,
+        residual_blocks: int = 0,
     ) -> None:
         super().__init__()
+        if residual_blocks < 0:
+            raise ValueError("residual_blocks must be non-negative")
         self.embedding = nn.Embedding(256, embedding_dim)
         kernels = ((1, 2), (1, 4), (2, 2), (4, 4))
         self.branches = nn.ModuleList(
@@ -63,6 +84,9 @@ class BGICNN(nn.Module):
             nn.Conv2d(branch_channels * len(kernels), output_dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(output_dim),
             nn.GELU(),
+        )
+        self.residual_blocks = nn.Sequential(
+            *(ResidualConvBlock(output_dim) for _ in range(residual_blocks))
         )
         self.se = SEBlock(output_dim, se_reduction)
         self.output_norm = nn.LayerNorm(output_dim)
@@ -74,6 +98,7 @@ class BGICNN(nn.Module):
             raise ValueError("byte_tokens must have shape [batch, packets, 32]")
         x = self.embedding(byte_tokens).permute(0, 3, 1, 2).contiguous()
         x = self.mix(torch.cat([branch(x) for branch in self.branches], dim=1))
+        x = self.residual_blocks(x)
         x, se_weights = self.se(x)
         row_mask = byte_mask[:, None, :, None]
         masked = x.masked_fill(~row_mask, torch.finfo(x.dtype).min)
@@ -82,4 +107,3 @@ class BGICNN(nn.Module):
         if no_packets.any():
             pooled = pooled.masked_fill(no_packets[:, None], 0.0)
         return self.output_norm(pooled), {"se_weights": se_weights}
-

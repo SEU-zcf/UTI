@@ -24,15 +24,28 @@ class SinusoidalPositionEncoding(nn.Module):
 
 
 class LocalWindowAttention(nn.Module):
-    def __init__(self, dim: int, heads: int, window: int, dropout: float) -> None:
+    def __init__(
+        self, dim: int, heads: int, window: int, dropout: float, shift_size: int = 0
+    ) -> None:
         super().__init__()
+        if window < 1:
+            raise ValueError("window must be positive")
+        if not 0 <= shift_size < window:
+            raise ValueError("shift_size must be in [0, window)")
         self.window = window
+        self.shift_size = shift_size
         self.attention = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         batch, length, dim = x.shape
-        padded_length = math.ceil(length / self.window) * self.window
-        padding = padded_length - length
+        # Offset padding, rather than cyclic rolling, prevents opposite sequence
+        # boundaries from attending to each other in shifted windows.
+        if self.shift_size:
+            x = F.pad(x, (0, 0, self.shift_size, 0))
+            mask = F.pad(mask, (self.shift_size, 0), value=False)
+        shifted_length = x.shape[1]
+        padded_length = math.ceil(shifted_length / self.window) * self.window
+        padding = padded_length - shifted_length
         if padding:
             x = F.pad(x, (0, 0, 0, padding))
             mask = F.pad(mask, (0, padding), value=False)
@@ -49,7 +62,11 @@ class LocalWindowAttention(nn.Module):
         output, _ = self.attention(xw, xw, xw, key_padding_mask=key_padding, need_weights=False)
         output = output.masked_fill(~mw.unsqueeze(-1), 0.0)
         output = output.reshape(batch, windows, self.window, dim).reshape(batch, padded_length, dim)
-        return output[:, :length]
+        if self.shift_size:
+            output = output[:, self.shift_size : self.shift_size + length]
+        else:
+            output = output[:, :length]
+        return output
 
 
 class ScaleGating(nn.Module):
@@ -100,10 +117,14 @@ class TWTBlock(nn.Module):
         windows: tuple[int, ...],
         expansion: int,
         dropout: float,
+        shifted_windows: bool = False,
     ) -> None:
         super().__init__()
         self.attention_branches = nn.ModuleList(
-            LocalWindowAttention(dim, heads, window, dropout) for window in windows
+            LocalWindowAttention(
+                dim, heads, window, dropout, shift_size=(window // 2 if shifted_windows else 0)
+            )
+            for window in windows
         )
         self.attention_gate = ScaleGating(dim, len(windows))
         self.attention_norm = nn.LayerNorm(dim)
@@ -141,11 +162,31 @@ class TWT(nn.Module):
         expansion: int = 4,
         dropout: float = 0.1,
         max_length: int = 512,
+        depth: int = 1,
+        shifted_windows: bool = False,
     ) -> None:
         super().__init__()
+        if depth < 1:
+            raise ValueError("depth must be positive")
         self.input_projection = nn.Linear(1, dim)
         self.position = SinusoidalPositionEncoding(dim, max_length)
-        self.block = TWTBlock(dim, heads, windows, expansion, dropout)
+        self.depth = depth
+        # Keep the original attribute name and state-dict layout for the baseline
+        # one-block model, so its existing checkpoints remain loadable.
+        if depth == 1:
+            self.block = TWTBlock(dim, heads, windows, expansion, dropout)
+        else:
+            self.blocks = nn.ModuleList(
+                TWTBlock(
+                    dim,
+                    heads,
+                    windows,
+                    expansion,
+                    dropout,
+                    shifted_windows=shifted_windows and index % 2 == 1,
+                )
+                for index in range(depth)
+            )
         self.output_norm = nn.LayerNorm(dim)
 
     def forward(
@@ -154,8 +195,19 @@ class TWT(nn.Module):
         x = self.input_projection(length_direction.unsqueeze(-1))
         x = self.position(x)
         x = x.masked_fill(~length_mask.unsqueeze(-1), 0.0)
-        x, diagnostics = self.block(x, length_mask)
+        if self.depth == 1:
+            x, diagnostics = self.block(x, length_mask)
+        else:
+            diagnostics = {}
+            for index, block in enumerate(self.blocks):
+                x, layer_diagnostics = block(x, length_mask)
+                diagnostics.update(
+                    {f"layer_{index}_{key}": value for key, value in layer_diagnostics.items()}
+                )
+            # Preserve the original diagnostic keys for consumers that only need
+            # the final TWT block.
+            diagnostics["attention_scale_weights"] = layer_diagnostics["attention_scale_weights"]
+            diagnostics["ffn_scale_weights"] = layer_diagnostics["ffn_scale_weights"]
         denominator = length_mask.sum(dim=1, keepdim=True).clamp_min(1).to(x.dtype)
         pooled = x.sum(dim=1) / denominator
         return self.output_norm(pooled), diagnostics
-

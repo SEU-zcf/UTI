@@ -22,6 +22,7 @@ class UTIMPC(nn.Module):
             branch_channels=int(config.get("branch_channels", 32)),
             output_dim=byte_dim,
             se_reduction=int(config.get("se_reduction", 8)),
+            residual_blocks=int(config.get("bgi_residual_blocks", 0)),
         )
         self.twt = TWT(
             dim=time_dim,
@@ -30,9 +31,19 @@ class UTIMPC(nn.Module):
             expansion=int(config.get("ffn_expansion", 4)),
             dropout=dropout,
             max_length=int(config.get("max_length", 512)),
+            depth=int(config.get("twt_depth", 1)),
+            shifted_windows=bool(config.get("shifted_windows", False)),
         )
         fusion_dim = byte_dim + time_dim
         self.modality_gate = nn.Linear(fusion_dim, fusion_dim)
+        self.use_fusion_residual = bool(config.get("fusion_residual", False))
+        if self.use_fusion_residual:
+            self.fusion_residual = nn.Sequential(
+                nn.Linear(fusion_dim, fusion_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self.fusion_norm = nn.LayerNorm(fusion_dim)
         self.projector = nn.Sequential(
             nn.Linear(fusion_dim, fusion_dim),
             nn.GELU(),
@@ -52,7 +63,10 @@ class UTIMPC(nn.Module):
         time_features, time_details = self.twt(length_direction, length_mask)
         combined = torch.cat((byte_features, time_features), dim=1)
         gate = torch.sigmoid(self.modality_gate(combined))
-        embedding = F.normalize(self.projector(gate * combined), p=2, dim=1, eps=1e-8)
+        gated = gate * combined
+        if self.use_fusion_residual:
+            gated = self.fusion_norm(combined + self.fusion_residual(gated))
+        embedding = F.normalize(self.projector(gated), p=2, dim=1, eps=1e-8)
         if not return_details:
             return embedding
         return embedding, {
@@ -62,4 +76,3 @@ class UTIMPC(nn.Module):
             **byte_details,
             **time_details,
         }
-
