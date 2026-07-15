@@ -159,6 +159,17 @@ per class from correctly classified known validation samples only. Results are
 written to `decision_mode_comparison.csv`; `auxiliary_predictions.csv` contains
 the scores, thresholds, and predictions needed for detailed error analysis.
 
+For the fixed-update-budget UR20 experiment, use
+`iscxvpn2016_ur20_sanitized_steps.yaml`. It preserves the sanitized enhanced
+model and 8x64 batch but fixes each epoch at 64 balanced batches, giving 6,400
+optimizer updates over 100 epochs. Its output directory is separate from the
+original sanitized run.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.train \
+  --config configs/iscxvpn2016_ur20_sanitized_steps.yaml
+```
+
 ### Flow-length conditional experiments
 
 The `*_length_conditional.yaml` configurations retain every short flow. They

@@ -1,0 +1,10 @@
+extends: iscxvpn2016_ur20_sanitized.yaml
+
+# Experiment A: keep the enhanced model and 8x64 batch unchanged, but use a
+# fixed optimization budget after sanitization reduced the natural epoch to
+# only about 14 batches.
+train:
+  output_dir: outputs/iscxvpn2016_ur20_sanitized_steps
+  epochs: 100
+  stage1_epochs: 10
+  batches_per_epoch: 64
