@@ -170,6 +170,12 @@ CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.train \
   --config configs/iscxvpn2016_ur20_sanitized_steps.yaml
 ```
 
+The follow-up `iscxvpn2016_ur20_sanitized_arcface.yaml` experiment keeps the
+same 6,400-update budget and inference architecture. During the formal training
+stage it adds a normalized ArcFace classifier with weight `0.3`, scale `30`,
+and angular margin `0.2`. The classifier state is checkpointed for exact resume
+but is not used for prototype calibration or evaluation.
+
 ### Flow-length conditional experiments
 
 The `*_length_conditional.yaml` configurations retain every short flow. They

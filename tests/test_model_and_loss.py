@@ -52,3 +52,23 @@ def test_protomargin_has_finite_warmup_and_formal_losses():
     assert torch.isfinite(formal["total"])
     formal["total"].backward()
     assert embeddings.grad is not None
+
+
+def test_arcface_auxiliary_loss_is_formal_stage_only_and_differentiable():
+    embeddings = torch.nn.functional.normalize(torch.randn(8, 16), dim=1).requires_grad_()
+    labels = torch.tensor([1, 1, 1, 1, 4, 4, 4, 4])
+    criterion = ProtoMarginLoss(
+        known_classes=[1, 4],
+        embedding_dim=16,
+        lambda_arcface=0.3,
+        arcface_scale=16.0,
+        arcface_margin=0.2,
+    )
+    warmup = criterion(embeddings, labels, "warmup")
+    assert warmup["arcface"].item() == 0.0
+    formal = criterion(embeddings, labels, "formal")
+    assert torch.isfinite(formal["arcface"])
+    assert formal["arcface"] > 0.0
+    formal["total"].backward()
+    assert embeddings.grad is not None
+    assert criterion.arcface.weight.grad is not None

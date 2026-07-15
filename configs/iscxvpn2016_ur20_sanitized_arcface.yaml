@@ -1,0 +1,11 @@
+extends: iscxvpn2016_ur20_sanitized_steps.yaml
+
+# Experiment B: retain the complete UTI-MPC inference architecture and add a
+# training-only angular classifier after the Triplet warmup stage.
+train:
+  output_dir: outputs/iscxvpn2016_ur20_sanitized_arcface
+
+loss:
+  lambda_arcface: 0.3
+  arcface_scale: 30.0
+  arcface_margin: 0.2

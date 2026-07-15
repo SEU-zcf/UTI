@@ -66,6 +66,9 @@ loss:
   prototype_margin: 1.0
   lambda_intra: 0.5
   lambda_inter: 0.3
+  lambda_arcface: 0.1
+  arcface_scale: 16.0
+  arcface_margin: 0.2
 train:
   output_dir: {output}
   seed: 42

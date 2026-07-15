@@ -36,6 +36,7 @@ def _autocast(device: torch.device, amp_dtype: torch.dtype | None):
 
 def _checkpoint_payload(
     model: torch.nn.Module,
+    criterion: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     scaler: torch.amp.GradScaler,
@@ -45,6 +46,7 @@ def _checkpoint_payload(
 ) -> dict[str, Any]:
     return {
         "model": model.state_dict(),
+        "criterion": criterion.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
@@ -104,8 +106,20 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
     model: torch.nn.Module = raw_model
     if bool(config["train"].get("compile", False)):
         model = torch.compile(raw_model)
+    criterion = ProtoMarginLoss(
+        triplet_margin=float(config["loss"]["triplet_margin"]),
+        prototype_margin=float(config["loss"]["prototype_margin"]),
+        lambda_intra=float(config["loss"]["lambda_intra"]),
+        lambda_inter=float(config["loss"]["lambda_inter"]),
+        known_classes=list(config["split"]["known_classes"]),
+        embedding_dim=int(config["model"].get("embedding_dim", 128)),
+        lambda_arcface=float(config["loss"].get("lambda_arcface", 0.0)),
+        arcface_scale=float(config["loss"].get("arcface_scale", 30.0)),
+        arcface_margin=float(config["loss"].get("arcface_margin", 0.2)),
+    ).to(device)
+    trainable_parameters = [*raw_model.parameters(), *criterion.parameters()]
     optimizer = AdamW(
-        raw_model.parameters(),
+        trainable_parameters,
         lr=float(config["train"]["learning_rate"]),
         weight_decay=float(config["train"]["weight_decay"]),
     )
@@ -116,12 +130,6 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
             epoch, int(config["train"]["warmup_epochs"]), epochs
         ),
     )
-    criterion = ProtoMarginLoss(
-        triplet_margin=float(config["loss"]["triplet_margin"]),
-        prototype_margin=float(config["loss"]["prototype_margin"]),
-        lambda_intra=float(config["loss"]["lambda_intra"]),
-        lambda_inter=float(config["loss"]["lambda_inter"]),
-    )
     use_fp16_scaler = device.type == "cuda" and amp_dtype == torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=use_fp16_scaler)
     start_epoch = 0
@@ -129,6 +137,10 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
     if resume:
         checkpoint = load_checkpoint(resume, device)
         raw_model.load_state_dict(checkpoint["model"])
+        if "criterion" in checkpoint:
+            criterion.load_state_dict(checkpoint["criterion"])
+        elif criterion.arcface is not None:
+            raise ValueError("ArcFace checkpoint is missing the criterion state")
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         scaler.load_state_dict(checkpoint.get("scaler", {}))
@@ -149,7 +161,13 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
             sampler.set_epoch(epoch)
         model.train()
         stage = "warmup" if epoch < stage1_epochs else "formal"
-        totals = {"total": 0.0, "triplet": 0.0, "intra": 0.0, "inter": 0.0}
+        totals = {
+            "total": 0.0,
+            "triplet": 0.0,
+            "intra": 0.0,
+            "inter": 0.0,
+            "arcface": 0.0,
+        }
         batches = 0
         for batch in loaders["train"]:
             optimizer.zero_grad(set_to_none=True)
@@ -167,12 +185,12 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
             if use_fp16_scaler:
                 scaler.scale(losses["total"]).backward()
                 scaler.unscale_(optimizer)
-                clip_grad_norm_(raw_model.parameters(), gradient_clip)
+                clip_grad_norm_(trainable_parameters, gradient_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 losses["total"].backward()
-                clip_grad_norm_(raw_model.parameters(), gradient_clip)
+                clip_grad_norm_(trainable_parameters, gradient_clip)
                 optimizer.step()
             for key in totals:
                 totals[key] += float(losses[key].detach())
@@ -209,11 +227,25 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
             if validation_accuracy > best_validation:
                 best_validation = validation_accuracy
                 payload = _checkpoint_payload(
-                    raw_model, optimizer, scheduler, scaler, epoch, best_validation, config
+                    raw_model,
+                    criterion,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch,
+                    best_validation,
+                    config,
                 )
                 save_checkpoint(output_dir / "best.pt", payload, device)
         payload = _checkpoint_payload(
-            raw_model, optimizer, scheduler, scaler, epoch, best_validation, config
+            raw_model,
+            criterion,
+            optimizer,
+            scheduler,
+            scaler,
+            epoch,
+            best_validation,
+            config,
         )
         save_checkpoint(output_dir / "last.pt", payload, device)
         append_jsonl(metrics_path, record)
