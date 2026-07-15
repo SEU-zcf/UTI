@@ -63,6 +63,25 @@ python -m uti_mpc.preprocess \
 
 The cache defaults to `data/processed/iscxvpn2016`. It contains memory-mapped NumPy shards and `manifest.json`. Processing keeps IPv4 TCP/UDP flows only, aggregates bidirectional five-tuples with a 60-second idle timeout, and records one label per capture.
 
+### Protocol-sanitized preprocessing
+
+The `*_sanitized.yaml` configurations create a separate
+`data/processed/iscxvpn2016_sanitized` cache. They remove only explicitly
+configured infrastructure traffic (DNS, DHCP, NetBIOS, SSDP, WS-Discovery,
+mDNS, LLMNR, IPv4 multicast, and limited broadcast) before capture-level labels
+are assigned to model samples. Ports are used only for this audit-driven cleanup
+and are not model inputs. The original cache remains unchanged.
+
+```bash
+python -m uti_mpc.preprocess \
+  --config configs/iscxvpn2016_ur20_sanitized.yaml \
+  --pcap-root /path/to/ISCX-VPN-NonVPN-2016
+```
+
+The sanitized cache contains `sanitization_audit.json` with kept/dropped flow,
+packet, and byte counts for every capture and exclusion reason. One preprocessing
+pass is shared by UR20, UR40, and UR60 sanitized experiments.
+
 ## Training
 
 Run each paper split independently:

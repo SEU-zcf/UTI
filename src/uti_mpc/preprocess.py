@@ -11,6 +11,7 @@ from tqdm import tqdm
 from uti_mpc.config import load_config, require_keys
 from uti_mpc.data.flow import iter_capture_flows
 from uti_mpc.data.labels import ISCXVPN2016_CLASSES, LabelResolver
+from uti_mpc.data.sanitization import BackgroundFlowFilter, FlowAudit
 
 
 def _safe_stem(path: Path) -> str:
@@ -39,6 +40,9 @@ def preprocess(
         raise FileNotFoundError(f"No .pcap or .pcapng files found under {root}")
     resolver = LabelResolver(root, label_map)
     data_config = config["data"]
+    background_filter = BackgroundFlowFilter.from_config(
+        data_config.get("background_filter", {})
+    )
     manifest: dict = {
         "version": 1,
         "dataset": "ISCXVPN2016",
@@ -50,12 +54,18 @@ def preprocess(
             "idle_timeout": float(data_config["idle_timeout"]),
             "min_packets": int(data_config.get("min_packets", 1)),
             "length_mode": "ipv4_total_length",
+            "background_filter": (
+                background_filter.to_dict() if background_filter is not None else {"enabled": False}
+            ),
         },
         "shards": [],
     }
     total = 0
+    total_audit = FlowAudit()
+    capture_audits: list[dict] = []
     for capture_index, capture in enumerate(tqdm(captures, desc="PCAP files")):
         label = resolver.resolve(capture)
+        capture_audit = FlowAudit() if background_filter is not None else None
         flows = list(
             iter_capture_flows(
                 capture,
@@ -63,8 +73,20 @@ def preprocess(
                 nlengths=int(data_config["nl"]),
                 idle_timeout=float(data_config["idle_timeout"]),
                 min_packets=int(data_config.get("min_packets", 1)),
+                background_filter=background_filter,
+                audit=capture_audit,
             )
         )
+        if capture_audit is not None:
+            total_audit.merge(capture_audit)
+            capture_audits.append(
+                {
+                    "capture": capture.relative_to(root).as_posix(),
+                    "label": label,
+                    "label_name": ISCXVPN2016_CLASSES[label],
+                    **capture_audit.to_dict(),
+                }
+            )
         if not flows:
             continue
         shard_id = f"{capture_index:05d}_{_safe_stem(capture)}"
@@ -106,6 +128,17 @@ def preprocess(
         total += len(flows)
     if not manifest["shards"]:
         raise RuntimeError("No valid IPv4 TCP/UDP flows were extracted")
+    if background_filter is not None:
+        audit_path = destination / "sanitization_audit.json"
+        audit_payload = {
+            "version": 1,
+            "rules": background_filter.to_dict(),
+            "totals": total_audit.to_dict(),
+            "captures": capture_audits,
+        }
+        with audit_path.open("w", encoding="utf-8") as handle:
+            json.dump(audit_payload, handle, ensure_ascii=False, indent=2)
+        manifest["sanitization_audit"] = audit_path.relative_to(destination).as_posix()
     manifest["total_samples"] = total
     manifest_path = destination / "manifest.json"
     temporary = destination / "manifest.json.tmp"
@@ -113,6 +146,13 @@ def preprocess(
         json.dump(manifest, handle, ensure_ascii=False, indent=2)
     temporary.replace(manifest_path)
     print(f"Wrote {total} flows in {len(manifest['shards'])} shards to {manifest_path}")
+    if background_filter is not None:
+        dropped = total_audit.dropped_flows
+        candidates = total_audit.candidate_flows
+        print(
+            f"Sanitization kept {total_audit.kept_flows}/{candidates} flows and dropped "
+            f"{dropped}; audit={destination / 'sanitization_audit.json'}"
+        )
     return manifest_path
 
 
@@ -128,4 +168,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

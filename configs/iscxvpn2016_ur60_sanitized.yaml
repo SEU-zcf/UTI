@@ -1,0 +1,14 @@
+extends: iscxvpn2016_ur60_enhanced.yaml
+
+data:
+  cache_dir: data/processed/iscxvpn2016_sanitized
+  background_filter:
+    enabled: true
+    udp_ports: [53, 67, 68, 137, 138, 546, 547, 1900, 3702, 5353, 5355]
+    tcp_ports: [53]
+    exclude_ipv4_multicast: true
+    exclude_limited_broadcast: true
+
+train:
+  output_dir: outputs/iscxvpn2016_ur60_sanitized
+

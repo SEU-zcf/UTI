@@ -5,6 +5,7 @@ import pytest
 dpkt = pytest.importorskip("dpkt")
 
 from uti_mpc.data.flow import iter_capture_flows
+from uti_mpc.data.sanitization import BackgroundFlowFilter, FlowAudit
 
 
 def _ethernet_packet(src, dst, sport, dport, payload, udp=False):
@@ -63,3 +64,38 @@ def test_raw_ip_linktype_101_is_supported(tmp_path: Path):
     flows = list(iter_capture_flows(capture, npackets=4, nlengths=4))
     assert len(flows) == 1
     assert flows[0].byte_mask.tolist() == [True, False, False, False]
+
+
+def test_background_protocol_filter_keeps_application_flow_and_audits_dns(tmp_path: Path):
+    capture = tmp_path / "mixed.pcap"
+    left = b"\x0a\x00\x00\x01"
+    right = b"\x0a\x00\x00\x02"
+    with capture.open("wb") as handle:
+        writer = dpkt.pcap.Writer(handle)
+        writer.writepkt(_ethernet_packet(left, right, 1111, 443, b"app"), ts=1.0)
+        writer.writepkt(_ethernet_packet(left, right, 2222, 53, b"dns", udp=True), ts=2.0)
+        writer.close()
+    background_filter = BackgroundFlowFilter(udp_ports=frozenset({53}))
+    audit = FlowAudit()
+    flows = list(
+        iter_capture_flows(
+            capture,
+            npackets=4,
+            nlengths=4,
+            background_filter=background_filter,
+            audit=audit,
+        )
+    )
+    assert len(flows) == 1
+    assert audit.candidate_flows == 2
+    assert audit.kept_flows == 1
+    assert audit.dropped_flows == 1
+    assert audit.reason_flows["udp_port_53"] == 1
+
+
+def test_multicast_background_reason_is_detected():
+    background_filter = BackgroundFlowFilter()
+    reason = background_filter.reason(
+        b"\x0a\x00\x00\x01", b"\xe0\x00\x00\xfc", 40000, 40001, 17
+    )
+    assert reason == "ipv4_multicast"

@@ -9,6 +9,8 @@ from typing import BinaryIO, Iterator
 import dpkt
 import numpy as np
 
+from uti_mpc.data.sanitization import BackgroundFlowFilter, FlowAudit
+
 
 @dataclass
 class FlowFeatures:
@@ -28,6 +30,8 @@ class _FlowState:
     byte_rows: list[bytes] = field(default_factory=list)
     lengths: list[float] = field(default_factory=list)
     packets: int = 0
+    byte_count: int = 0
+    background_reason: str | None = None
 
 
 def _reader(handle: BinaryIO):
@@ -98,12 +102,31 @@ def _finalize(state: _FlowState, npackets: int, nlengths: int) -> FlowFeatures:
     return FlowFeatures(digest, byte_tokens, byte_mask, length_direction, length_mask)
 
 
+def _finish_state(
+    state: _FlowState,
+    npackets: int,
+    nlengths: int,
+    min_packets: int,
+    audit: FlowAudit | None,
+) -> FlowFeatures | None:
+    reason = state.background_reason
+    if state.packets < min_packets:
+        reason = "min_packets"
+    if audit is not None:
+        audit.record(state.packets, state.byte_count, reason)
+    if reason is not None:
+        return None
+    return _finalize(state, npackets, nlengths)
+
+
 def iter_capture_flows(
     capture: str | Path,
     npackets: int = 64,
     nlengths: int = 32,
     idle_timeout: float = 60.0,
     min_packets: int = 1,
+    background_filter: BackgroundFlowFilter | None = None,
+    audit: FlowAudit | None = None,
 ) -> Iterator[FlowFeatures]:
     active: dict[tuple, _FlowState] = {}
     with Path(capture).open("rb") as handle:
@@ -125,8 +148,9 @@ def iter_capture_flows(
             key = _canonical_key(src, sport, dst, dport, protocol)
             state = active.get(key)
             if state is not None and timestamp - state.last > idle_timeout:
-                if state.packets >= min_packets:
-                    yield _finalize(state, npackets, nlengths)
+                finished = _finish_state(state, npackets, nlengths, min_packets, audit)
+                if finished is not None:
+                    yield finished
                 state = None
             if state is None:
                 state = _FlowState(
@@ -134,6 +158,11 @@ def iter_capture_flows(
                     origin=(src, sport, dst, dport),
                     start=float(timestamp),
                     last=float(timestamp),
+                    background_reason=(
+                        background_filter.reason(src, dst, sport, dport, protocol)
+                        if background_filter is not None
+                        else None
+                    ),
                 )
                 active[key] = state
             direction = 1.0 if (src, sport, dst, dport) == state.origin else -1.0
@@ -143,6 +172,8 @@ def iter_capture_flows(
                 state.lengths.append(direction * min(total_length, 1500) / 1500.0)
             state.last = float(timestamp)
             state.packets += 1
+            state.byte_count += total_length
     for state in active.values():
-        if state.packets >= min_packets:
-            yield _finalize(state, npackets, nlengths)
+        finished = _finish_state(state, npackets, nlengths, min_packets, audit)
+        if finished is not None:
+            yield finished
