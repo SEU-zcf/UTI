@@ -12,3 +12,8 @@ data:
 train:
   output_dir: outputs/iscxvpn2016_ur40_sanitized
 
+evaluation:
+  threshold_source: validation
+  threshold_quantile: 0.95
+  minimum_threshold_samples: 5
+  use_train_threshold_floor: true

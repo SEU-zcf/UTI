@@ -97,6 +97,18 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
     train_features, train_labels, _, train_packet_counts = extract_embeddings(
         model, loaders["train_eval"], device, amp_dtype
     )
+    evaluation_config = config["evaluation"]
+    threshold_source = str(evaluation_config.get("threshold_source", "train")).lower()
+    if threshold_source not in {"train", "validation"}:
+        raise ValueError("evaluation.threshold_source must be 'train' or 'validation'")
+    validation_features = validation_labels = validation_packet_counts = None
+    if threshold_source == "validation":
+        (
+            validation_features,
+            validation_labels,
+            _,
+            validation_packet_counts,
+        ) = extract_embeddings(model, loaders["validation"], device, amp_dtype)
     test_features, test_labels, flow_ids, test_packet_counts = extract_embeddings(
         model, loaders["test"], device, amp_dtype
     )
@@ -104,15 +116,29 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
         config["data"].get("flow_length_bucket_edges", [1, 2, 8])
     )
     train_buckets = packet_counts_to_buckets(train_packet_counts, bucket_edges)
+    validation_buckets = (
+        packet_counts_to_buckets(validation_packet_counts, bucket_edges)
+        if validation_packet_counts is not None
+        else None
+    )
     test_buckets = packet_counts_to_buckets(test_packet_counts, bucket_edges)
-    length_conditioned = bool(config["evaluation"].get("length_conditioned_prototypes", False))
+    length_conditioned = bool(evaluation_config.get("length_conditioned_prototypes", False))
     artifacts = calibrate_open_set(
         train_features,
         train_labels,
         split.known_classes,
-        quantile=float(config["evaluation"].get("threshold_quantile", 0.95)),
+        quantile=float(evaluation_config.get("threshold_quantile", 0.95)),
         buckets=train_buckets if length_conditioned else None,
         bucket_values=list(range(len(bucket_edges) + 1)) if length_conditioned else None,
+        calibration_features=validation_features,
+        calibration_labels=validation_labels,
+        calibration_buckets=validation_buckets if length_conditioned else None,
+        minimum_calibration_samples=int(
+            evaluation_config.get("minimum_threshold_samples", 5)
+        ),
+        use_train_threshold_floor=bool(
+            evaluation_config.get("use_train_threshold_floor", True)
+        ),
     )
     predictions, distances = predict_open_set(
         test_features, artifacts, buckets=test_buckets if length_conditioned else None
@@ -139,6 +165,29 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
     nearest_thresholds = per_sample_thresholds.gather(1, nearest_positions[:, None]).squeeze(1)
     nearest_thresholds = nearest_thresholds.clamp_min(torch.finfo(thresholds.dtype).eps)
     threshold_ratios = nearest_distances / nearest_thresholds
+    known_mask = torch.zeros_like(test_labels, dtype=torch.bool)
+    for label in split.known_classes:
+        known_mask |= test_labels == int(label)
+    known_count = int(known_mask.sum())
+    accepted_known = known_mask & (predictions != -1)
+    accepted_known_count = int(accepted_known.sum())
+    closed_set_known_correct = int((known_mask & (nearest_classes == test_labels)).sum())
+    metrics.update(
+        {
+            "closed_set_KCA": closed_set_known_correct / known_count if known_count else 0.0,
+            "closed_set_known_correct": closed_set_known_correct,
+            "known_test_samples": known_count,
+            "known_rejection_rate": float((known_mask & (predictions == -1)).sum()) / known_count
+            if known_count
+            else 0.0,
+            "accepted_known_accuracy": float(
+                (accepted_known & (predictions == test_labels)).sum()
+            )
+            / accepted_known_count
+            if accepted_known_count
+            else 0.0,
+        }
+    )
     if not torch.allclose(distances, nearest_distances, atol=1e-6, rtol=1e-5):
         raise RuntimeError("Prediction distances do not match nearest prototype distances")
     raw_target_order = sorted(int(label) for label in torch.unique(test_labels).tolist())
@@ -184,12 +233,27 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
     result_dir = output_dir / "evaluation"
     result_dir.mkdir(parents=True, exist_ok=True)
     atomic_torch_save(artifacts, result_dir / "open_set_artifacts.pt")
+    source_codes = artifacts["threshold_source_codes"]
+    sample_counts = artifacts["threshold_sample_counts"]
+
+    def source_label(code: int) -> str:
+        if code == 1:
+            return "validation"
+        return "train_fallback" if threshold_source == "validation" else "train"
+
     serializable = {
         **metrics,
         "checkpoint": str(Path(checkpoint_path).resolve()),
         "known_classes": list(split.known_classes),
         "unknown_classes": list(split.unknown_classes),
         "threshold_quantile": float(artifacts["quantile"]),
+        "threshold_source": threshold_source,
+        "minimum_threshold_samples": int(
+            evaluation_config.get("minimum_threshold_samples", 5)
+        ),
+        "use_train_threshold_floor": bool(
+            evaluation_config.get("use_train_threshold_floor", True)
+        ),
         "length_conditioned_prototypes": length_conditioned,
         "flow_length_bucket_edges": list(bucket_edges),
         "thresholds": (
@@ -210,6 +274,34 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
                 )
             }
         ),
+        "threshold_calibration_counts": (
+            {
+                str(int(label)): {
+                    flow_length_bucket_name(bucket, bucket_edges): int(value)
+                    for bucket, value in enumerate(row.tolist())
+                }
+                for label, row in zip(artifacts["classes"], sample_counts, strict=True)
+            }
+            if length_conditioned
+            else {
+                str(int(label)): int(value)
+                for label, value in zip(artifacts["classes"], sample_counts, strict=True)
+            }
+        ),
+        "threshold_sources": (
+            {
+                str(int(label)): {
+                    flow_length_bucket_name(bucket, bucket_edges): source_label(int(value))
+                    for bucket, value in enumerate(row.tolist())
+                }
+                for label, row in zip(artifacts["classes"], source_codes, strict=True)
+            }
+            if length_conditioned
+            else {
+                str(int(label)): source_label(int(value))
+                for label, value in zip(artifacts["classes"], source_codes, strict=True)
+            }
+        ),
         "confusion_order": order,
         "confusion_matrix": matrix.tolist(),
         "raw_target_order": raw_target_order,
@@ -221,7 +313,20 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
     with (result_dir / "metrics.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["metric", "value"])
-        for key in ("PR", "KCA", "UDR", "KP", "KN", "KU", "UP", "UN", "total"):
+        for key in (
+            "PR",
+            "KCA",
+            "UDR",
+            "closed_set_KCA",
+            "known_rejection_rate",
+            "accepted_known_accuracy",
+            "KP",
+            "KN",
+            "KU",
+            "UP",
+            "UN",
+            "total",
+        ):
             writer.writerow([key, metrics[key]])
     with (result_dir / "flow_length_metrics.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
@@ -257,9 +362,6 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
             handle,
             fieldnames=[
                 "capture",
-                "packet_count",
-                "flow_length_bucket",
-                "flow_length_bucket_name",
                 "target",
                 "target_name",
                 "nearest_prototype",
@@ -279,6 +381,9 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
             [
                 "flow_id",
                 "capture",
+                "packet_count",
+                "flow_length_bucket",
+                "flow_length_bucket_name",
                 "target",
                 "prediction",
                 "nearest_prototype",

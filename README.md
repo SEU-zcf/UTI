@@ -140,6 +140,16 @@ distance, and threshold-ratio distributions.
 `capture_prediction_breakdown.csv` further aggregates these diagnostics by source
 PCAP capture, preserving the original class and final prediction.
 
+The sanitized configurations use held-out known validation embeddings for
+class-specific threshold calibration while always computing prototypes from the
+training set. A class with fewer than `minimum_threshold_samples` correctly
+classified validation examples falls back to its train-derived threshold; the
+train threshold is also retained as a lower bound. `metrics.json` records the
+effective source and sample count for every threshold, plus pre-rejection
+`closed_set_KCA`, `known_rejection_rate`, and `accepted_known_accuracy`.
+This evaluation-only change can be applied to an existing checkpoint without
+retraining.
+
 ### Flow-length conditional experiments
 
 The `*_length_conditional.yaml` configurations retain every short flow. They

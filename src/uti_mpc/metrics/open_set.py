@@ -46,8 +46,42 @@ def calibrate_open_set(
     quantile: float = 0.95,
     buckets: torch.Tensor | None = None,
     bucket_values: Sequence[int] | None = None,
+    calibration_features: torch.Tensor | None = None,
+    calibration_labels: torch.Tensor | None = None,
+    calibration_buckets: torch.Tensor | None = None,
+    minimum_calibration_samples: int = 5,
+    use_train_threshold_floor: bool = True,
 ) -> dict[str, torch.Tensor]:
+    """Build train prototypes and calibrate class-specific rejection thresholds.
+
+    ``features`` always defines the prototypes.  When ``calibration_features``
+    is supplied, thresholds are estimated from correctly classified held-out
+    known samples.  Classes (or class/bucket pairs) with too few held-out
+    samples fall back to their train-derived threshold.
+    """
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError("quantile must be between 0 and 1")
+    if minimum_calibration_samples < 1:
+        raise ValueError("minimum_calibration_samples must be at least 1")
+    if (calibration_features is None) != (calibration_labels is None):
+        raise ValueError(
+            "calibration_features and calibration_labels must be provided together"
+        )
+
     prototypes, classes = compute_prototypes(features, labels, known_classes)
+    if calibration_features is not None:
+        if (
+            calibration_features.ndim != features.ndim
+            or calibration_features.shape[1:] != features.shape[1:]
+        ):
+            raise ValueError("Calibration features do not match prototype feature dimensions")
+        if len(calibration_features) != len(calibration_labels):
+            raise ValueError("Calibration features and labels must have the same length")
+        known = set(int(label) for label in classes.tolist())
+        unexpected = sorted(set(int(label) for label in calibration_labels.tolist()) - known)
+        if unexpected:
+            raise ValueError(f"Threshold calibration contains unknown classes: {unexpected}")
+
     if buckets is not None:
         if len(buckets) != len(labels):
             raise ValueError("buckets must have the same length as labels")
@@ -81,22 +115,70 @@ def calibrate_open_set(
 
         distances = _conditional_squared_distances(features, conditional_prototypes, positions)
         predicted = classes[distances.argmin(dim=1)]
-        thresholds = torch.empty((len(classes), len(values)), dtype=torch.float32, device=features.device)
+        thresholds = torch.empty(
+            (len(classes), len(values)), dtype=torch.float32, device=features.device
+        )
+        threshold_counts = torch.zeros_like(thresholds, dtype=torch.long)
         for class_position, label in enumerate(classes):
             for bucket_position, bucket in enumerate(values):
                 class_mask = (labels == label) & (buckets_on_device == bucket)
                 selected = distances[class_mask & (predicted == label), class_position]
                 if len(selected) == 0:
                     selected = distances[class_mask, class_position]
+                threshold_counts[class_position, bucket_position] = len(selected)
                 thresholds[class_position, bucket_position] = (
                     torch.quantile(selected.float(), quantile)
                     if len(selected)
                     else global_thresholds[class_position]
                 )
+
+        train_thresholds = thresholds.clone()
+        threshold_source_codes = torch.zeros_like(thresholds, dtype=torch.long)
+        if calibration_features is not None:
+            if calibration_buckets is None or len(calibration_buckets) != len(
+                calibration_labels
+            ):
+                raise ValueError(
+                    "calibration_buckets matching calibration_labels are required for conditional calibration"
+                )
+            calibration_positions = _bucket_positions(
+                calibration_buckets.to(features.device), values
+            )
+            calibration_distances = _conditional_squared_distances(
+                calibration_features.to(features.device),
+                conditional_prototypes,
+                calibration_positions,
+            )
+            calibration_predicted = classes[calibration_distances.argmin(dim=1)]
+            calibration_labels_on_device = calibration_labels.to(features.device)
+            calibration_buckets_on_device = calibration_buckets.to(features.device)
+            for class_position, label in enumerate(classes):
+                for bucket_position, bucket in enumerate(values):
+                    selected = calibration_distances[
+                        (calibration_labels_on_device == label)
+                        & (calibration_buckets_on_device == bucket)
+                        & (calibration_predicted == label),
+                        class_position,
+                    ]
+                    threshold_counts[class_position, bucket_position] = len(selected)
+                    if len(selected) < minimum_calibration_samples:
+                        continue
+                    candidate = torch.quantile(selected.float(), quantile)
+                    thresholds[class_position, bucket_position] = (
+                        torch.maximum(
+                            candidate, train_thresholds[class_position, bucket_position]
+                        )
+                        if use_train_threshold_floor
+                        else candidate
+                    )
+                    threshold_source_codes[class_position, bucket_position] = 1
         return {
             "prototypes": conditional_prototypes.cpu(),
             "classes": classes.cpu(),
             "thresholds": thresholds.cpu(),
+            "train_thresholds": train_thresholds.cpu(),
+            "threshold_sample_counts": threshold_counts.cpu(),
+            "threshold_source_codes": threshold_source_codes.cpu(),
             "bucket_values": values.cpu(),
             "quantile": torch.tensor(quantile),
         }
@@ -105,17 +187,53 @@ def calibrate_open_set(
     nearest_positions = distances.argmin(dim=1)
     predicted = classes[nearest_positions]
     thresholds = []
+    train_counts = []
     for position, label in enumerate(classes):
         class_mask = labels == label
         correctly_classified = class_mask & (predicted == label)
         selected = distances[correctly_classified, position]
         if len(selected) == 0:
             selected = distances[class_mask, position]
+        train_counts.append(len(selected))
         thresholds.append(torch.quantile(selected.float(), quantile))
+    train_thresholds = torch.stack(thresholds)
+    threshold_counts = torch.tensor(train_counts, dtype=torch.long, device=features.device)
+    threshold_source_codes = torch.zeros(
+        len(classes), dtype=torch.long, device=features.device
+    )
+
+    if calibration_features is not None:
+        calibration_features_on_device = calibration_features.to(features.device)
+        calibration_labels_on_device = calibration_labels.to(features.device)
+        calibration_distances = squared_distances(calibration_features_on_device, prototypes)
+        calibration_predicted = classes[calibration_distances.argmin(dim=1)]
+        thresholds = train_thresholds.clone()
+        for position, label in enumerate(classes):
+            selected = calibration_distances[
+                (calibration_labels_on_device == label)
+                & (calibration_predicted == label),
+                position,
+            ]
+            threshold_counts[position] = len(selected)
+            if len(selected) < minimum_calibration_samples:
+                continue
+            candidate = torch.quantile(selected.float(), quantile)
+            thresholds[position] = (
+                torch.maximum(candidate, train_thresholds[position])
+                if use_train_threshold_floor
+                else candidate
+            )
+            threshold_source_codes[position] = 1
+    else:
+        thresholds = train_thresholds
+
     return {
         "prototypes": prototypes.cpu(),
         "classes": classes.cpu(),
-        "thresholds": torch.stack(thresholds).cpu(),
+        "thresholds": thresholds.cpu(),
+        "train_thresholds": train_thresholds.cpu(),
+        "threshold_sample_counts": threshold_counts.cpu(),
+        "threshold_source_codes": threshold_source_codes.cpu(),
         "quantile": torch.tensor(quantile),
     }
 

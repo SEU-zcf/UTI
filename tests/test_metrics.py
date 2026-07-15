@@ -25,6 +25,43 @@ def test_calibration_and_open_set_metrics():
     assert metrics["UDR"] == 1.0
 
 
+def test_validation_thresholds_keep_train_prototypes_and_record_fallback_metadata():
+    train_features = torch.tensor(
+        [[0.0, 0.0], [0.1, 0.0], [1.0, 0.0], [0.9, 0.0]]
+    )
+    train_labels = torch.tensor([1, 1, 2, 2])
+    validation_features = torch.tensor([[0.2, 0.0], [0.8, 0.0]])
+    validation_labels = torch.tensor([1, 2])
+
+    artifacts = calibrate_open_set(
+        train_features,
+        train_labels,
+        [1, 2],
+        quantile=0.95,
+        calibration_features=validation_features,
+        calibration_labels=validation_labels,
+        minimum_calibration_samples=1,
+    )
+
+    assert torch.allclose(
+        artifacts["prototypes"], torch.tensor([[0.05, 0.0], [0.95, 0.0]])
+    )
+    assert torch.all(artifacts["thresholds"] > artifacts["train_thresholds"])
+    assert artifacts["threshold_sample_counts"].tolist() == [1, 1]
+    assert artifacts["threshold_source_codes"].tolist() == [1, 1]
+
+    fallback = calibrate_open_set(
+        train_features,
+        train_labels,
+        [1, 2],
+        calibration_features=validation_features,
+        calibration_labels=validation_labels,
+        minimum_calibration_samples=2,
+    )
+    assert torch.equal(fallback["thresholds"], fallback["train_thresholds"])
+    assert fallback["threshold_source_codes"].tolist() == [0, 0]
+
+
 def test_raw_confusion_and_distance_diagnostics_preserve_unknown_classes():
     targets = torch.tensor([1, 3, 10, 10])
     predictions = torch.tensor([1, 5, -1, 5])

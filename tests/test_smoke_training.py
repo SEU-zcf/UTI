@@ -89,6 +89,9 @@ train:
 evaluation:
   batch_size: 8
   threshold_quantile: 0.95
+  threshold_source: validation
+  minimum_threshold_samples: 1
+  use_train_threshold_floor: true
   length_conditioned_prototypes: true
 """,
         encoding="utf-8",
@@ -103,6 +106,14 @@ evaluation:
     resumed = train(config, output / "last.pt")
     assert resumed.exists()
     metrics = evaluate(config, best)
-    assert {"PR", "KCA", "UDR"}.issubset(metrics)
+    assert {
+        "PR",
+        "KCA",
+        "UDR",
+        "closed_set_KCA",
+        "known_rejection_rate",
+        "accepted_known_accuracy",
+    }.issubset(metrics)
+    assert metrics["threshold_source"] == "validation"
     assert metrics["length_conditioned_prototypes"] is True
     assert (output / "evaluation" / "flow_length_metrics.csv").exists()
