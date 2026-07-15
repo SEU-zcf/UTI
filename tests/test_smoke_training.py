@@ -43,6 +43,7 @@ def test_one_epoch_train_resume_calibrate_and_evaluate(tmp_path: Path):
         f"""
 data:
   cache_dir: {cache}
+  flow_length_bucket_edges: [1, 2, 8]
 model:
   byte_embedding_dim: 8
   branch_channels: 4
@@ -88,6 +89,7 @@ train:
 evaluation:
   batch_size: 8
   threshold_quantile: 0.95
+  length_conditioned_prototypes: true
 """,
         encoding="utf-8",
     )
@@ -102,3 +104,5 @@ evaluation:
     assert resumed.exists()
     metrics = evaluate(config, best)
     assert {"PR", "KCA", "UDR"}.issubset(metrics)
+    assert metrics["length_conditioned_prototypes"] is True
+    assert (output / "evaluation" / "flow_length_metrics.csv").exists()

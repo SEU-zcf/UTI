@@ -22,13 +22,85 @@ def compute_prototypes(
     return torch.stack(prototypes), class_tensor
 
 
+def _bucket_positions(assignments: torch.Tensor, bucket_values: torch.Tensor) -> torch.Tensor:
+    matches = assignments.to(bucket_values.device)[:, None] == bucket_values[None, :]
+    if not matches.any(dim=1).all():
+        missing = torch.unique(assignments[~matches.any(dim=1)]).tolist()
+        raise ValueError(f"No prototype bucket is available for assignments: {missing}")
+    return matches.to(torch.long).argmax(dim=1)
+
+
+def _conditional_squared_distances(
+    features: torch.Tensor, prototypes: torch.Tensor, bucket_positions: torch.Tensor
+) -> torch.Tensor:
+    # prototypes: [classes, buckets, dimensions]. Select a class prototype for
+    # each sample's observed flow-length bucket, producing [samples, classes].
+    selected = prototypes[:, bucket_positions, :].permute(1, 0, 2)
+    return (features[:, None, :] - selected).square().sum(dim=2)
+
+
 def calibrate_open_set(
     features: torch.Tensor,
     labels: torch.Tensor,
     known_classes: Sequence[int],
     quantile: float = 0.95,
+    buckets: torch.Tensor | None = None,
+    bucket_values: Sequence[int] | None = None,
 ) -> dict[str, torch.Tensor]:
     prototypes, classes = compute_prototypes(features, labels, known_classes)
+    if buckets is not None:
+        if len(buckets) != len(labels):
+            raise ValueError("buckets must have the same length as labels")
+        values = torch.tensor(
+            sorted(set(int(value) for value in (bucket_values or torch.unique(buckets).tolist()))),
+            dtype=torch.long,
+            device=features.device,
+        )
+        buckets_on_device = buckets.to(features.device)
+        positions = _bucket_positions(buckets_on_device, values)
+        conditional_prototypes = torch.empty(
+            (len(classes), len(values), features.shape[1]), dtype=features.dtype, device=features.device
+        )
+        for class_position, label in enumerate(classes):
+            class_features = features[labels == label]
+            for bucket_position, bucket in enumerate(values):
+                selected = class_features[buckets_on_device[labels == label] == bucket]
+                conditional_prototypes[class_position, bucket_position] = (
+                    selected.mean(dim=0) if len(selected) else prototypes[class_position]
+                )
+
+        global_distances = squared_distances(features, prototypes)
+        global_predicted = classes[global_distances.argmin(dim=1)]
+        global_thresholds = []
+        for position, label in enumerate(classes):
+            class_mask = labels == label
+            selected = global_distances[class_mask & (global_predicted == label), position]
+            if len(selected) == 0:
+                selected = global_distances[class_mask, position]
+            global_thresholds.append(torch.quantile(selected.float(), quantile))
+
+        distances = _conditional_squared_distances(features, conditional_prototypes, positions)
+        predicted = classes[distances.argmin(dim=1)]
+        thresholds = torch.empty((len(classes), len(values)), dtype=torch.float32, device=features.device)
+        for class_position, label in enumerate(classes):
+            for bucket_position, bucket in enumerate(values):
+                class_mask = (labels == label) & (buckets_on_device == bucket)
+                selected = distances[class_mask & (predicted == label), class_position]
+                if len(selected) == 0:
+                    selected = distances[class_mask, class_position]
+                thresholds[class_position, bucket_position] = (
+                    torch.quantile(selected.float(), quantile)
+                    if len(selected)
+                    else global_thresholds[class_position]
+                )
+        return {
+            "prototypes": conditional_prototypes.cpu(),
+            "classes": classes.cpu(),
+            "thresholds": thresholds.cpu(),
+            "bucket_values": values.cpu(),
+            "quantile": torch.tensor(quantile),
+        }
+
     distances = squared_distances(features, prototypes)
     nearest_positions = distances.argmin(dim=1)
     predicted = classes[nearest_positions]
@@ -52,14 +124,24 @@ def predict_open_set(
     features: torch.Tensor,
     artifacts: dict[str, torch.Tensor],
     unknown_label: int = -1,
+    buckets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     prototypes = artifacts["prototypes"].to(features.device)
     classes = artifacts["classes"].to(features.device)
     thresholds = artifacts["thresholds"].to(features.device)
-    distances = squared_distances(features, prototypes)
+    if "bucket_values" in artifacts:
+        if buckets is None:
+            raise ValueError("Flow-length buckets are required by conditional prototypes")
+        bucket_values = artifacts["bucket_values"].to(features.device)
+        positions = _bucket_positions(buckets.to(features.device), bucket_values)
+        distances = _conditional_squared_distances(features, prototypes, positions)
+        per_sample_thresholds = thresholds[:, positions].transpose(0, 1)
+    else:
+        distances = squared_distances(features, prototypes)
+        per_sample_thresholds = thresholds.unsqueeze(0).expand(len(features), -1)
     nearest_distance, nearest_position = distances.min(dim=1)
     predicted = classes[nearest_position]
-    accepted = nearest_distance <= thresholds[nearest_position]
+    accepted = nearest_distance <= per_sample_thresholds.gather(1, nearest_position[:, None]).squeeze(1)
     predicted = torch.where(accepted, predicted, torch.full_like(predicted, unknown_label))
     return predicted, nearest_distance
 

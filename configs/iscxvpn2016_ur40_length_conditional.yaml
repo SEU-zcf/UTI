@@ -1,0 +1,12 @@
+extends: iscxvpn2016_ur40_enhanced.yaml
+
+data:
+  flow_length_bucket_edges: [1, 2, 8]
+
+train:
+  output_dir: outputs/iscxvpn2016_ur40_length_conditional
+  stratify_by_flow_length: true
+
+evaluation:
+  length_conditioned_prototypes: true
+

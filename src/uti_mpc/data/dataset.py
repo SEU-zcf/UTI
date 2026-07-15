@@ -50,6 +50,10 @@ class TrafficDataset(Dataset[dict[str, Any]]):
         shard_index, local = self._locate(index)
         return int(self._arrays(shard_index)[4][local])
 
+    def get_packet_count(self, index: int) -> int:
+        shard_index, local = self._locate(index)
+        return int(self._arrays(shard_index)[1][local].sum())
+
     def labels(self) -> np.ndarray:
         return np.fromiter((self.get_label(index) for index in range(len(self))), dtype=np.int64)
 
@@ -63,7 +67,7 @@ class TrafficDataset(Dataset[dict[str, Any]]):
             "byte_mask": torch.as_tensor(np.array(byte_mask[local]), dtype=torch.bool),
             "length_direction": torch.as_tensor(np.array(lengths[local]), dtype=torch.float32),
             "length_mask": torch.as_tensor(np.array(length_mask[local]), dtype=torch.bool),
+            "packet_count": torch.tensor(int(byte_mask[local].sum()), dtype=torch.long),
             "label": torch.tensor(int(labels[local]), dtype=torch.long),
             "flow_id": flow_id,
         }
-

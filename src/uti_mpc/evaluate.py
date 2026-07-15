@@ -9,6 +9,11 @@ from pathlib import Path
 import torch
 
 from uti_mpc.config import load_config
+from uti_mpc.data.buckets import (
+    flow_length_bucket_name,
+    packet_counts_to_buckets,
+    validate_flow_length_bucket_edges,
+)
 from uti_mpc.data.labels import ISCXVPN2016_CLASSES
 from uti_mpc.engine.checkpoint import load_checkpoint
 from uti_mpc.engine.features import extract_embeddings
@@ -89,28 +94,50 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
     model = UTIMPC(config["model"]).to(device)
     checkpoint = load_checkpoint(checkpoint_path, device)
     model.load_state_dict(checkpoint["model"])
-    train_features, train_labels, _ = extract_embeddings(
+    train_features, train_labels, _, train_packet_counts = extract_embeddings(
         model, loaders["train_eval"], device, amp_dtype
     )
-    test_features, test_labels, flow_ids = extract_embeddings(
+    test_features, test_labels, flow_ids, test_packet_counts = extract_embeddings(
         model, loaders["test"], device, amp_dtype
     )
+    bucket_edges = validate_flow_length_bucket_edges(
+        config["data"].get("flow_length_bucket_edges", [1, 2, 8])
+    )
+    train_buckets = packet_counts_to_buckets(train_packet_counts, bucket_edges)
+    test_buckets = packet_counts_to_buckets(test_packet_counts, bucket_edges)
+    length_conditioned = bool(config["evaluation"].get("length_conditioned_prototypes", False))
     artifacts = calibrate_open_set(
         train_features,
         train_labels,
         split.known_classes,
         quantile=float(config["evaluation"].get("threshold_quantile", 0.95)),
+        buckets=train_buckets if length_conditioned else None,
+        bucket_values=list(range(len(bucket_edges) + 1)) if length_conditioned else None,
     )
-    predictions, distances = predict_open_set(test_features, artifacts)
+    predictions, distances = predict_open_set(
+        test_features, artifacts, buckets=test_buckets if length_conditioned else None
+    )
     metrics = compute_open_set_metrics(test_labels, predictions, split.known_classes)
     matrix, order = confusion_matrix(test_labels, predictions, split.known_classes)
     prototypes = artifacts["prototypes"].to(test_features.device)
     prototype_classes = artifacts["classes"].to(test_features.device)
     thresholds = artifacts["thresholds"].to(test_features.device)
-    all_distances = squared_distances(test_features, prototypes)
+    if length_conditioned:
+        bucket_values = artifacts["bucket_values"].to(test_features.device)
+        matches = test_buckets.to(test_features.device)[:, None] == bucket_values[None, :]
+        if not matches.any(dim=1).all():
+            raise RuntimeError("Evaluation contains a flow-length bucket with no prototype")
+        bucket_positions = matches.to(torch.long).argmax(dim=1)
+        selected_prototypes = prototypes[:, bucket_positions, :].permute(1, 0, 2)
+        all_distances = (test_features[:, None, :] - selected_prototypes).square().sum(dim=2)
+        per_sample_thresholds = thresholds[:, bucket_positions].transpose(0, 1)
+    else:
+        all_distances = squared_distances(test_features, prototypes)
+        per_sample_thresholds = thresholds.unsqueeze(0).expand(len(test_features), -1)
     nearest_distances, nearest_positions = all_distances.min(dim=1)
     nearest_classes = prototype_classes[nearest_positions]
-    nearest_thresholds = thresholds[nearest_positions].clamp_min(torch.finfo(thresholds.dtype).eps)
+    nearest_thresholds = per_sample_thresholds.gather(1, nearest_positions[:, None]).squeeze(1)
+    nearest_thresholds = nearest_thresholds.clamp_min(torch.finfo(thresholds.dtype).eps)
     threshold_ratios = nearest_distances / nearest_thresholds
     if not torch.allclose(distances, nearest_distances, atol=1e-6, rtol=1e-5):
         raise RuntimeError("Prediction distances do not match nearest prototype distances")
@@ -125,6 +152,21 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
         raw_target_order,
         order,
     )
+    flow_length_metrics = []
+    for bucket in range(len(bucket_edges) + 1):
+        selected = test_buckets == bucket
+        if not selected.any():
+            continue
+        flow_length_metrics.append(
+            {
+                "bucket": bucket,
+                "bucket_name": flow_length_bucket_name(bucket, bucket_edges),
+                "count": int(selected.sum()),
+                **compute_open_set_metrics(
+                    test_labels[selected], predictions[selected], split.known_classes
+                ),
+            }
+        )
     # ``capture`` is present in current preprocessing manifests.  The fallback
     # keeps legacy caches and minimal synthetic manifests evaluable.
     captures_by_shard = {
@@ -148,14 +190,31 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
         "known_classes": list(split.known_classes),
         "unknown_classes": list(split.unknown_classes),
         "threshold_quantile": float(artifacts["quantile"]),
-        "thresholds": {
-            str(int(label)): float(value)
-            for label, value in zip(artifacts["classes"], artifacts["thresholds"], strict=True)
-        },
+        "length_conditioned_prototypes": length_conditioned,
+        "flow_length_bucket_edges": list(bucket_edges),
+        "thresholds": (
+            {
+                str(int(label)): {
+                    flow_length_bucket_name(bucket, bucket_edges): float(value)
+                    for bucket, value in enumerate(row.tolist())
+                }
+                for label, row in zip(
+                    artifacts["classes"], artifacts["thresholds"], strict=True
+                )
+            }
+            if length_conditioned
+            else {
+                str(int(label)): float(value)
+                for label, value in zip(
+                    artifacts["classes"], artifacts["thresholds"], strict=True
+                )
+            }
+        ),
         "confusion_order": order,
         "confusion_matrix": matrix.tolist(),
         "raw_target_order": raw_target_order,
         "raw_confusion_matrix": raw_matrix.tolist(),
+        "flow_length_metrics": flow_length_metrics,
     }
     with (result_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(serializable, handle, indent=2, ensure_ascii=False)
@@ -164,6 +223,13 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
         writer.writerow(["metric", "value"])
         for key in ("PR", "KCA", "UDR", "KP", "KN", "KU", "UP", "UN", "total"):
             writer.writerow([key, metrics[key]])
+    with (result_dir / "flow_length_metrics.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["bucket", "bucket_name", "count", "PR", "KCA", "UDR", "KP", "KN", "KU", "UP", "UN", "total"],
+        )
+        writer.writeheader()
+        writer.writerows(flow_length_metrics)
     with (result_dir / "confusion_matrix.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["target/prediction", *order])
@@ -191,6 +257,9 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
             handle,
             fieldnames=[
                 "capture",
+                "packet_count",
+                "flow_length_bucket",
+                "flow_length_bucket_name",
                 "target",
                 "target_name",
                 "nearest_prototype",
@@ -218,9 +287,11 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
                 "threshold_ratio",
             ]
         )
-        for flow_id, capture, target, prediction, nearest_class, distance, threshold, ratio in zip(
+        for flow_id, capture, packet_count, bucket, target, prediction, nearest_class, distance, threshold, ratio in zip(
             flow_ids,
             captures,
+            test_packet_counts.tolist(),
+            test_buckets.tolist(),
             test_labels.tolist(),
             predictions.tolist(),
             nearest_classes.tolist(),
@@ -230,7 +301,19 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
             strict=True,
         ):
             writer.writerow(
-                [flow_id, capture, target, prediction, nearest_class, distance, threshold, ratio]
+                [
+                    flow_id,
+                    capture,
+                    packet_count,
+                    bucket,
+                    flow_length_bucket_name(bucket, bucket_edges),
+                    target,
+                    prediction,
+                    nearest_class,
+                    distance,
+                    threshold,
+                    ratio,
+                ]
             )
     print(json.dumps(serializable, indent=2, ensure_ascii=False))
     return serializable

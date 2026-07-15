@@ -65,10 +65,10 @@ def _known_validation_accuracy(
     device: torch.device,
     amp_dtype: torch.dtype | None,
 ) -> float:
-    train_features, train_labels, _ = extract_embeddings(
+    train_features, train_labels, _, _ = extract_embeddings(
         model, loaders["train_eval"], device, amp_dtype
     )
-    validation_features, validation_labels, _ = extract_embeddings(
+    validation_features, validation_labels, _, _ = extract_embeddings(
         model, loaders["validation"], device, amp_dtype
     )
     prototypes, classes = compute_prototypes(train_features, train_labels, known_classes)

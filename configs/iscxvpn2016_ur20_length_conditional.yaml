@@ -1,0 +1,13 @@
+extends: iscxvpn2016_ur20_enhanced.yaml
+
+data:
+  # Buckets: 1 packet, 2 packets, 3-8 packets, and >=9 packets.
+  flow_length_bucket_edges: [1, 2, 8]
+
+train:
+  output_dir: outputs/iscxvpn2016_ur20_length_conditional
+  stratify_by_flow_length: true
+
+evaluation:
+  length_conditioned_prototypes: true
+

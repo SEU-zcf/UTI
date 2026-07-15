@@ -18,10 +18,11 @@ def extract_embeddings(
     loader: DataLoader,
     device: torch.device,
     amp_dtype: torch.dtype | None,
-) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+) -> tuple[torch.Tensor, torch.Tensor, list[str], torch.Tensor]:
     model.eval()
     features: list[torch.Tensor] = []
     labels: list[torch.Tensor] = []
+    packet_counts: list[torch.Tensor] = []
     flow_ids: list[str] = []
     for batch in loader:
         with _autocast(device, amp_dtype):
@@ -33,8 +34,8 @@ def extract_embeddings(
             )
         features.append(output.float().cpu())
         labels.append(batch["label"].cpu())
+        packet_counts.append(batch["packet_count"].cpu())
         flow_ids.extend(batch["flow_id"])
     if not features:
         raise RuntimeError("Feature loader produced no batches")
-    return torch.cat(features), torch.cat(labels), flow_ids
-
+    return torch.cat(features), torch.cat(labels), flow_ids, torch.cat(packet_counts)

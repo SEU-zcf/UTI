@@ -6,6 +6,7 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader, Subset
 
+from uti_mpc.data.buckets import packet_counts_to_buckets
 from uti_mpc.data.dataset import TrafficDataset
 from uti_mpc.data.sampler import PKBatchSampler
 from uti_mpc.data.splits import OpenSetSplit, build_open_set_split
@@ -59,12 +60,19 @@ def build_loaders(
     q = int(config["train"]["samples_per_class"])
     train_subset = Subset(dataset, split.train.tolist())
     train_labels = [dataset.get_label(int(index)) for index in split.train]
+    train_packet_counts = torch.tensor(
+        [dataset.get_packet_count(int(index)) for index in split.train], dtype=torch.long
+    )
+    bucket_edges = config["data"].get("flow_length_bucket_edges", [1, 2, 8])
+    train_buckets = packet_counts_to_buckets(train_packet_counts, bucket_edges).tolist()
     sampler = PKBatchSampler(
         train_labels,
         p,
         q,
         seed=int(config["train"]["seed"]),
         batches_per_epoch=config["train"].get("batches_per_epoch"),
+        buckets=train_buckets,
+        stratify_by_bucket=bool(config["train"].get("stratify_by_flow_length", False)),
     )
     train_options = _loader_options(config, workers, p * q)
     train_options.pop("batch_size")
@@ -81,4 +89,3 @@ def build_loaders(
         Subset(dataset, split.test.tolist()), shuffle=False, **evaluation_options
     )
     return loaders
-

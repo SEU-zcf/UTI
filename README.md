@@ -121,6 +121,21 @@ distance, and threshold-ratio distributions.
 `capture_prediction_breakdown.csv` further aggregates these diagnostics by source
 PCAP capture, preserving the original class and final prediction.
 
+### Flow-length conditional experiments
+
+The `*_length_conditional.yaml` configurations retain every short flow. They
+stratify each P×Q batch by four observed packet-count buckets (`1`, `2`, `3-8`,
+and `>=9` packets), then calibrate a separate prototype and rejection threshold
+for every known-class/bucket pair. Evaluation writes `flow_length_metrics.csv`
+with PR/KCA/UDR for each bucket. These configurations use separate output paths
+and must be trained from scratch because their sampler differs from the standard
+enhanced experiment.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.train \
+  --config configs/iscxvpn2016_ur20_length_conditional.yaml
+```
+
 ## CPU smoke tests
 
 CPU mode is intended for verification, not full training. Tests override the CUDA/BF16 settings with a small synthetic configuration:
