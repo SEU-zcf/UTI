@@ -58,20 +58,40 @@ class LabelResolver:
                 return self.explicit[key]
 
         text = _normalize(relative)
-        is_vpn = "vpn" in text
-        if any(token in text for token in ("filetransfer", "ftps", "sftp", "scp")):
+        # The official dataset contains both VPN-PCAPS-* and NonVPN-PCAPs-*.
+        # A substring test would incorrectly label every NonVPN directory as VPN.
+        path_parts = [_normalize(part) for part in capture.resolve().relative_to(self.root).parts]
+        is_vpn = (
+            _normalize(capture.stem).startswith("vpn")
+            or any(part.startswith("vpn") and not part.startswith("nonvpn") for part in path_parts)
+        )
+        if any(
+            token in text
+            for token in (
+                "filetransfer",
+                "ftps",
+                "sftp",
+                "scp",
+                "files",
+                "skypefile",
+                "bittorrent",
+                "torrent",
+            )
+        ):
             base = 3
-        elif any(token in text for token in ("streaming", "youtube", "vimeo", "netflix", "spotify")):
+        elif any(
+            token in text
+            for token in ("streaming", "youtube", "vimeo", "netflix", "spotify", "video")
+        ):
             base = 4
         elif any(token in text for token in ("voip", "audio", "voice")):
             base = 5
-        elif any(token in text for token in ("email", "mail", "imap", "smtp")):
-            base = 2
         elif any(token in text for token in ("chat", "messenger", "hangout")):
             base = 1
+        elif any(token in text for token in ("email", "mail", "imap", "smtp")):
+            base = 2
         else:
             raise ValueError(
                 f"Cannot infer label for {relative!r}; provide --label-map with path,label columns"
             )
         return base + 5 if is_vpn else base
-

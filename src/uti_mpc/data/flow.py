@@ -42,7 +42,10 @@ def _reader(handle: BinaryIO):
 def _network_packet(buffer: bytes, datalink: int):
     if datalink == dpkt.pcap.DLT_EN10MB:
         return dpkt.ethernet.Ethernet(buffer).data
-    if datalink == getattr(dpkt.pcap, "DLT_RAW", 101):
+    # libpcap's historical DLT_RAW constant is 12, while PCAP files using the
+    # modern LINKTYPE_RAW registry encode raw IPv4/IPv6 packets as 101.  The
+    # official ISCX VPN captures use 101.
+    if datalink in {getattr(dpkt.pcap, "DLT_RAW", 12), 101}:
         return dpkt.ip.IP(buffer)
     if datalink == getattr(dpkt.pcap, "DLT_LINUX_SLL", 113):
         return dpkt.sll.SLL(buffer).data

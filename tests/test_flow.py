@@ -50,3 +50,16 @@ def test_bidirectional_flow_and_packet_layout(tmp_path: Path):
     assert bytes(udp.byte_tokens[0, 16:28]) == bytes(12)
     assert bytes(udp.byte_tokens[0, 28:31]) == b"dns"
 
+
+def test_raw_ip_linktype_101_is_supported(tmp_path: Path):
+    capture = tmp_path / "vpn_raw.pcap"
+    left = b"\x0a\x00\x00\x01"
+    right = b"\x0a\x00\x00\x02"
+    ethernet_packet = _ethernet_packet(left, right, 1111, 443, b"abc")
+    with capture.open("wb") as handle:
+        writer = dpkt.pcap.Writer(handle, linktype=101)
+        writer.writepkt(ethernet_packet[14:], ts=1.0)
+        writer.close()
+    flows = list(iter_capture_flows(capture, npackets=4, nlengths=4))
+    assert len(flows) == 1
+    assert flows[0].byte_mask.tolist() == [True, False, False, False]
