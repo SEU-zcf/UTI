@@ -8,14 +8,18 @@ from pathlib import Path
 import torch
 
 from uti_mpc.config import load_config
+from uti_mpc.data.labels import ISCXVPN2016_CLASSES
 from uti_mpc.engine.checkpoint import load_checkpoint
 from uti_mpc.engine.features import extract_embeddings
 from uti_mpc.engine.runtime import build_loaders, load_dataset_and_split
 from uti_mpc.metrics.open_set import (
     calibrate_open_set,
+    class_distance_diagnostics,
     compute_open_set_metrics,
     confusion_matrix,
     predict_open_set,
+    raw_confusion_matrix,
+    squared_distances,
 )
 from uti_mpc.models import UTIMPC
 from uti_mpc.utils import atomic_torch_save, choose_amp_dtype, seed_everything, select_single_device
@@ -48,6 +52,27 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
     predictions, distances = predict_open_set(test_features, artifacts)
     metrics = compute_open_set_metrics(test_labels, predictions, split.known_classes)
     matrix, order = confusion_matrix(test_labels, predictions, split.known_classes)
+    prototypes = artifacts["prototypes"].to(test_features.device)
+    prototype_classes = artifacts["classes"].to(test_features.device)
+    thresholds = artifacts["thresholds"].to(test_features.device)
+    all_distances = squared_distances(test_features, prototypes)
+    nearest_distances, nearest_positions = all_distances.min(dim=1)
+    nearest_classes = prototype_classes[nearest_positions]
+    nearest_thresholds = thresholds[nearest_positions].clamp_min(torch.finfo(thresholds.dtype).eps)
+    threshold_ratios = nearest_distances / nearest_thresholds
+    if not torch.allclose(distances, nearest_distances, atol=1e-6, rtol=1e-5):
+        raise RuntimeError("Prediction distances do not match nearest prototype distances")
+    raw_target_order = sorted(int(label) for label in torch.unique(test_labels).tolist())
+    raw_matrix = raw_confusion_matrix(test_labels, predictions, raw_target_order, order)
+    diagnostics = class_distance_diagnostics(
+        test_labels,
+        predictions,
+        nearest_classes,
+        nearest_distances,
+        threshold_ratios,
+        raw_target_order,
+        order,
+    )
     result_dir = output_dir / "evaluation"
     result_dir.mkdir(parents=True, exist_ok=True)
     atomic_torch_save(artifacts, result_dir / "open_set_artifacts.pt")
@@ -63,6 +88,8 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
         },
         "confusion_order": order,
         "confusion_matrix": matrix.tolist(),
+        "raw_target_order": raw_target_order,
+        "raw_confusion_matrix": raw_matrix.tolist(),
     }
     with (result_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(serializable, handle, indent=2, ensure_ascii=False)
@@ -76,13 +103,45 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
         writer.writerow(["target/prediction", *order])
         for label, row in zip(order, matrix.tolist(), strict=True):
             writer.writerow([label, *row])
+    with (result_dir / "raw_class_confusion.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["target/prediction", *order])
+        for label, row in zip(raw_target_order, raw_matrix.tolist(), strict=True):
+            writer.writerow([label, *row])
+    with (result_dir / "class_distance_diagnostics.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            [
+                {**entry, "target_name": ISCXVPN2016_CLASSES.get(entry["target"], "unknown")}
+                for entry in diagnostics
+            ],
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
     with (result_dir / "predictions.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["flow_id", "target", "prediction", "nearest_squared_distance"])
-        for flow_id, target, prediction, distance in zip(
-            flow_ids, test_labels.tolist(), predictions.tolist(), distances.tolist(), strict=True
+        writer.writerow(
+            [
+                "flow_id",
+                "target",
+                "prediction",
+                "nearest_prototype",
+                "nearest_squared_distance",
+                "nearest_threshold",
+                "threshold_ratio",
+            ]
+        )
+        for flow_id, target, prediction, nearest_class, distance, threshold, ratio in zip(
+            flow_ids,
+            test_labels.tolist(),
+            predictions.tolist(),
+            nearest_classes.tolist(),
+            nearest_distances.tolist(),
+            nearest_thresholds.tolist(),
+            threshold_ratios.tolist(),
+            strict=True,
         ):
-            writer.writerow([flow_id, target, prediction, distance])
+            writer.writerow([flow_id, target, prediction, nearest_class, distance, threshold, ratio])
     print(json.dumps(serializable, indent=2, ensure_ascii=False))
     return serializable
 
@@ -97,4 +156,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

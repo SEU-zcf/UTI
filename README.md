@@ -114,6 +114,10 @@ CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.evaluate \
 ```
 
 The evaluation directory contains prototypes and thresholds, PR/KCA/UDR, confusion matrix, and per-flow predictions. Unknown traffic is represented by prediction `-1`.
+It also contains `raw_class_confusion.csv`, which preserves the original labels
+of unknown classes rather than merging them into one row, and
+`class_distance_diagnostics.json`, with per-class acceptance, nearest-prototype,
+distance, and threshold-ratio distributions.
 
 ## CPU smoke tests
 

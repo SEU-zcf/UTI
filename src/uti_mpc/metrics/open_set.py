@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 
@@ -111,3 +111,74 @@ def confusion_matrix(
         matrix[mapping[target_group], mapping[prediction_group]] += 1
     return matrix, order
 
+
+def raw_confusion_matrix(
+    targets: torch.Tensor,
+    predictions: torch.Tensor,
+    target_order: Sequence[int],
+    prediction_order: Sequence[int],
+) -> torch.Tensor:
+    """Confusion matrix that preserves original labels, including unknown classes."""
+    target_index = {int(label): index for index, label in enumerate(target_order)}
+    prediction_index = {int(label): index for index, label in enumerate(prediction_order)}
+    matrix = torch.zeros((len(target_order), len(prediction_order)), dtype=torch.long)
+    for target, prediction in zip(targets.tolist(), predictions.tolist(), strict=True):
+        if target not in target_index:
+            raise ValueError(f"Target label {target} is not in target_order")
+        if prediction not in prediction_index:
+            raise ValueError(f"Prediction label {prediction} is not in prediction_order")
+        matrix[target_index[target], prediction_index[prediction]] += 1
+    return matrix
+
+
+def class_distance_diagnostics(
+    targets: torch.Tensor,
+    predictions: torch.Tensor,
+    nearest_classes: torch.Tensor,
+    nearest_distances: torch.Tensor,
+    threshold_ratios: torch.Tensor,
+    target_order: Sequence[int],
+    prediction_order: Sequence[int],
+    unknown_label: int = -1,
+) -> list[dict[str, Any]]:
+    """Summarize rejection and distance behavior for each original target class."""
+    quantiles = (0.05, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)
+    result: list[dict[str, Any]] = []
+    for target in target_order:
+        selected = targets == int(target)
+        count = int(selected.sum())
+        if count == 0:
+            continue
+        class_predictions = predictions[selected]
+        class_nearest = nearest_classes[selected]
+        distances = nearest_distances[selected].float()
+        ratios = threshold_ratios[selected].float()
+        distance_quantiles = torch.quantile(distances, torch.tensor(quantiles)).tolist()
+        ratio_quantiles = torch.quantile(ratios, torch.tensor(quantiles)).tolist()
+        result.append(
+            {
+                "target": int(target),
+                "count": count,
+                "accepted": int((class_predictions != unknown_label).sum()),
+                "rejected": int((class_predictions == unknown_label).sum()),
+                "rejection_rate": float((class_predictions == unknown_label).float().mean()),
+                "prediction_distribution": {
+                    str(label): int((class_predictions == int(label)).sum())
+                    for label in prediction_order
+                },
+                "nearest_prototype_distribution": {
+                    str(label): int((class_nearest == int(label)).sum())
+                    for label in prediction_order
+                    if label != unknown_label
+                },
+                "nearest_distance_quantiles": {
+                    str(quantile): float(value)
+                    for quantile, value in zip(quantiles, distance_quantiles, strict=True)
+                },
+                "threshold_ratio_quantiles": {
+                    str(quantile): float(value)
+                    for quantile, value in zip(quantiles, ratio_quantiles, strict=True)
+                },
+            }
+        )
+    return result

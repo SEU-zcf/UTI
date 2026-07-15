@@ -2,7 +2,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from uti_mpc.metrics.open_set import calibrate_open_set, compute_open_set_metrics, predict_open_set
+from uti_mpc.metrics.open_set import (
+    calibrate_open_set,
+    class_distance_diagnostics,
+    compute_open_set_metrics,
+    predict_open_set,
+    raw_confusion_matrix,
+)
 
 
 def test_calibration_and_open_set_metrics():
@@ -18,3 +24,20 @@ def test_calibration_and_open_set_metrics():
     assert metrics["KCA"] == 1.0
     assert metrics["UDR"] == 1.0
 
+
+def test_raw_confusion_and_distance_diagnostics_preserve_unknown_classes():
+    targets = torch.tensor([1, 3, 10, 10])
+    predictions = torch.tensor([1, 5, -1, 5])
+    nearest = torch.tensor([1, 5, 5, 5])
+    distances = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    ratios = torch.tensor([0.5, 0.8, 1.2, 1.6])
+    order = [1, 5, -1]
+    matrix = raw_confusion_matrix(targets, predictions, [1, 3, 10], order)
+    assert matrix.tolist() == [[1, 0, 0], [0, 1, 0], [0, 1, 1]]
+    diagnostics = class_distance_diagnostics(
+        targets, predictions, nearest, distances, ratios, [1, 3, 10], order
+    )
+    unknown_voip = diagnostics[-1]
+    assert unknown_voip["target"] == 10
+    assert unknown_voip["rejected"] == 1
+    assert unknown_voip["nearest_prototype_distribution"]["5"] == 2
