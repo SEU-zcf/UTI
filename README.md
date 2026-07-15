@@ -176,6 +176,27 @@ stage it adds a normalized ArcFace classifier with weight `0.3`, scale `30`,
 and angular margin `0.2`. The classifier state is checkpointed for exact resume
 but is not used for prototype calibration or evaluation.
 
+### UTI-MPC V2 architecture
+
+`iscxvpn2016_ur20_v2.yaml` keeps the existing sanitized cache and command-line
+interfaces while replacing three representation bottlenecks. Its byte branch
+encodes bytes within each packet before applying a masked packet Transformer;
+padding is removed before convolution. Byte and TWT packet tokens then interact
+through bidirectional cross-attention and a two-way reliability gate with no
+ungated residual bypass. Training uses three learnable subcenters per class and
+EMA-normalized loss weights. Evaluation independently builds deterministic
+spherical k-means subprototypes from training embeddings and calibrates a
+threshold for every subprototype.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.train \
+  --config configs/iscxvpn2016_ur20_v2.yaml
+
+CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.evaluate \
+  --config configs/iscxvpn2016_ur20_v2.yaml \
+  --checkpoint outputs/iscxvpn2016_ur20_v2/best.pt
+```
+
 ### Flow-length conditional experiments
 
 The `*_length_conditional.yaml` configurations retain every short flow. They

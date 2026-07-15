@@ -116,6 +116,13 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
         lambda_arcface=float(config["loss"].get("lambda_arcface", 0.0)),
         arcface_scale=float(config["loss"].get("arcface_scale", 30.0)),
         arcface_margin=float(config["loss"].get("arcface_margin", 0.2)),
+        subcenters_per_class=int(config["loss"].get("subcenters_per_class", 1)),
+        lambda_diversity=float(config["loss"].get("lambda_diversity", 0.0)),
+        subcenter_diversity_margin=float(
+            config["loss"].get("subcenter_diversity_margin", 0.2)
+        ),
+        loss_weighting=str(config["loss"].get("loss_weighting", "fixed")),
+        loss_ema_decay=float(config["loss"].get("loss_ema_decay", 0.95)),
     ).to(device)
     trainable_parameters = [*raw_model.parameters(), *criterion.parameters()]
     optimizer = AdamW(
@@ -161,13 +168,7 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
             sampler.set_epoch(epoch)
         model.train()
         stage = "warmup" if epoch < stage1_epochs else "formal"
-        totals = {
-            "total": 0.0,
-            "triplet": 0.0,
-            "intra": 0.0,
-            "inter": 0.0,
-            "arcface": 0.0,
-        }
+        totals: dict[str, float] | None = None
         batches = 0
         for batch in loaders["train"]:
             optimizer.zero_grad(set_to_none=True)
@@ -180,6 +181,8 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
                     batch["length_mask"].to(device, non_blocking=True),
                 )
                 losses = criterion(embeddings, labels, stage)
+            if totals is None:
+                totals = {key: 0.0 for key in losses}
             if not torch.isfinite(losses["total"]):
                 raise FloatingPointError(f"Non-finite loss at epoch={epoch}, batch={batches}")
             if use_fp16_scaler:
@@ -197,6 +200,8 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
             batches += 1
         if batches == 0:
             raise RuntimeError("Training loader produced no batches")
+        if totals is None:
+            raise RuntimeError("Training loss did not produce any values")
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         learning_rate = optimizer.param_groups[0]["lr"]

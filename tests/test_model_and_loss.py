@@ -72,3 +72,63 @@ def test_arcface_auxiliary_loss_is_formal_stage_only_and_differentiable():
     formal["total"].backward()
     assert embeddings.grad is not None
     assert criterion.arcface.weight.grad is not None
+
+
+def test_v2_hierarchical_cross_modal_model_masks_padding_and_backpropagates():
+    model = UTIMPC(
+        {
+            "hierarchical_bgi": True,
+            "cross_modal_fusion": True,
+            "byte_embedding_dim": 8,
+            "byte_dim": 16,
+            "time_dim": 16,
+            "embedding_dim": 8,
+            "byte_attention_heads": 4,
+            "byte_packet_layers": 1,
+            "cross_modal_dim": 16,
+            "cross_attention_heads": 4,
+            "attention_heads": 4,
+            "windows": [2, 4],
+            "ffn_expansion": 2,
+            "dropout": 0.0,
+            "max_length": 16,
+            "max_packets": 16,
+            "twt_depth": 2,
+            "shifted_windows": True,
+        }
+    )
+    byte_tokens = torch.randint(0, 256, (2, 8, 32))
+    byte_mask = torch.tensor(
+        [[True] * 8, [True, True, False, False, False, False, False, False]]
+    )
+    altered = byte_tokens.clone()
+    altered[1, 2:] = torch.randint(0, 256, altered[1, 2:].shape)
+    lengths = torch.randn(2, 4)
+    length_mask = torch.tensor([[True] * 4, [True, True, False, False]])
+    model.eval()
+    first, details = model(byte_tokens, lengths, byte_mask, length_mask, True)
+    second = model(altered, lengths, byte_mask, length_mask)
+    assert torch.allclose(first[1], second[1], atol=1e-6)
+    assert details["modality_gate"].shape == (2, 2)
+    assert torch.allclose(first.norm(dim=1), torch.ones(2), atol=1e-5)
+    first.sum().backward()
+    assert any(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_subcenter_loss_and_ema_weighting_are_finite_and_trainable():
+    embeddings = torch.nn.functional.normalize(torch.randn(12, 16), dim=1).requires_grad_()
+    labels = torch.tensor([1] * 6 + [4] * 6)
+    criterion = ProtoMarginLoss(
+        known_classes=[1, 4],
+        embedding_dim=16,
+        subcenters_per_class=3,
+        lambda_intra=1.0,
+        lambda_inter=1.0,
+        lambda_diversity=0.2,
+        loss_weighting="ema",
+    )
+    losses = criterion(embeddings, labels, "formal")
+    assert torch.isfinite(losses["total"])
+    assert "weight_intra" in losses
+    losses["total"].backward()
+    assert criterion.subcenters.centers.grad is not None

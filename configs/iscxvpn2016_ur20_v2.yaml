@@ -1,0 +1,31 @@
+extends: iscxvpn2016_ur20_sanitized_steps.yaml
+
+model:
+  hierarchical_bgi: true
+  byte_embedding_dim: 32
+  byte_dim: 128
+  byte_attention_heads: 4
+  byte_packet_layers: 2
+  max_packets: 64
+  cross_modal_fusion: true
+  cross_modal_dim: 128
+  cross_attention_heads: 4
+  time_dim: 128
+  embedding_dim: 128
+  dropout: 0.1
+
+loss:
+  lambda_arcface: 0.0
+  subcenters_per_class: 3
+  lambda_intra: 1.0
+  lambda_inter: 1.0
+  lambda_diversity: 0.2
+  subcenter_diversity_margin: 0.2
+  loss_weighting: ema
+  loss_ema_decay: 0.95
+
+evaluation:
+  subprototypes_per_class: 3
+
+train:
+  output_dir: outputs/iscxvpn2016_ur20_v2

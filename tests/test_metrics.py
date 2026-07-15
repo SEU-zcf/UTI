@@ -5,6 +5,7 @@ torch = pytest.importorskip("torch")
 from uti_mpc.metrics.open_set import (
     calibrate_auxiliary_rejection,
     calibrate_open_set,
+    calibrate_subprototype_open_set,
     class_conditional_knn_scores,
     class_distance_diagnostics,
     compute_open_set_metrics,
@@ -100,6 +101,42 @@ def test_auxiliary_rejection_uses_local_class_support_and_prototype_margin():
     assert knn_scores[0] <= artifacts["knn_thresholds"][threshold_positions[0]]
     assert knn_scores[1] > artifacts["knn_thresholds"][threshold_positions[1]]
     assert ratios[0] < ratios[1]
+
+
+def test_subprototype_calibration_models_multimodal_known_classes():
+    features = torch.nn.functional.normalize(
+        torch.tensor(
+            [
+                [1.0, 0.1],
+                [1.0, -0.1],
+                [0.1, 1.0],
+                [-0.1, 1.0],
+                [-1.0, 0.1],
+                [-1.0, -0.1],
+                [0.1, -1.0],
+                [-0.1, -1.0],
+            ]
+        ),
+        dim=1,
+    )
+    labels = torch.tensor([1, 1, 1, 1, 2, 2, 2, 2])
+    validation = torch.nn.functional.normalize(
+        torch.tensor([[1.0, 0.05], [0.05, 1.0], [-1.0, 0.05], [0.05, -1.0]]),
+        dim=1,
+    )
+    validation_labels = torch.tensor([1, 1, 2, 2])
+    artifacts = calibrate_subprototype_open_set(
+        features,
+        labels,
+        [1, 2],
+        subprototypes_per_class=2,
+        calibration_features=validation,
+        calibration_labels=validation_labels,
+        minimum_calibration_samples=1,
+    )
+    assert artifacts["prototypes"].shape == (2, 2, 2)
+    predictions, _ = predict_open_set(validation, artifacts)
+    assert predictions.tolist() == validation_labels.tolist()
 
 
 def test_raw_confusion_and_distance_diagnostics_preserve_unknown_classes():

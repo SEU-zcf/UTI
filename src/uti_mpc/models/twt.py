@@ -190,8 +190,11 @@ class TWT(nn.Module):
         self.output_norm = nn.LayerNorm(dim)
 
     def forward(
-        self, length_direction: torch.Tensor, length_mask: torch.Tensor
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        self,
+        length_direction: torch.Tensor,
+        length_mask: torch.Tensor,
+        return_tokens: bool = False,
+    ):
         x = self.input_projection(length_direction.unsqueeze(-1))
         x = self.position(x)
         x = x.masked_fill(~length_mask.unsqueeze(-1), 0.0)
@@ -210,4 +213,7 @@ class TWT(nn.Module):
             diagnostics["ffn_scale_weights"] = layer_diagnostics["ffn_scale_weights"]
         denominator = length_mask.sum(dim=1, keepdim=True).clamp_min(1).to(x.dtype)
         pooled = x.sum(dim=1) / denominator
-        return self.output_norm(pooled), diagnostics
+        pooled = self.output_norm(pooled)
+        if return_tokens:
+            return pooled, x, diagnostics
+        return pooled, diagnostics

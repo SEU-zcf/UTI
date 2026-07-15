@@ -5,6 +5,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from uti_mpc.losses.arcface import ArcFaceLoss
+from uti_mpc.losses.subcenter import EMALossBalancer, SubcenterPrototypeLoss
 
 
 def pairwise_squared_distance(embeddings: torch.Tensor) -> torch.Tensor:
@@ -26,6 +27,11 @@ class ProtoMarginLoss(nn.Module):
         lambda_arcface: float = 0.0,
         arcface_scale: float = 30.0,
         arcface_margin: float = 0.2,
+        subcenters_per_class: int = 1,
+        lambda_diversity: float = 0.0,
+        subcenter_diversity_margin: float = 0.2,
+        loss_weighting: str = "fixed",
+        loss_ema_decay: float = 0.95,
     ) -> None:
         super().__init__()
         self.triplet_margin = triplet_margin
@@ -51,6 +57,30 @@ class ProtoMarginLoss(nn.Module):
             raise ValueError(
                 "known_classes and embedding_dim are required when ArcFace is enabled"
             )
+        self.lambda_diversity = float(lambda_diversity)
+        self.subcenters = (
+            SubcenterPrototypeLoss(
+                int(embedding_dim),
+                known_classes,
+                subcenters_per_class=subcenters_per_class,
+                inter_margin=prototype_margin,
+                diversity_margin=subcenter_diversity_margin,
+            )
+            if subcenters_per_class > 1
+            and embedding_dim is not None
+            and known_classes is not None
+            else None
+        )
+        if subcenters_per_class > 1 and self.subcenters is None:
+            raise ValueError(
+                "known_classes and embedding_dim are required for subcenter prototypes"
+            )
+        if loss_weighting not in {"fixed", "ema"}:
+            raise ValueError("loss_weighting must be 'fixed' or 'ema'")
+        self.loss_weighting = loss_weighting
+        self.loss_balancer = (
+            EMALossBalancer(4, decay=loss_ema_decay) if loss_weighting == "ema" else None
+        )
 
     def _random_triplet(self, distances: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         losses: list[torch.Tensor] = []
@@ -116,26 +146,45 @@ class ProtoMarginLoss(nn.Module):
                 "intra": zero,
                 "inter": zero,
                 "arcface": zero,
+                "diversity": zero,
             }
         if stage != "formal":
             raise ValueError(f"Unknown training stage: {stage}")
         triplet = self._batch_hard_triplet(distances, labels)
-        intra, inter = self._prototype_losses(embeddings, labels)
+        if self.subcenters is not None:
+            intra, inter, diversity = self.subcenters(embeddings, labels)
+        else:
+            intra, inter = self._prototype_losses(embeddings, labels)
+            diversity = embeddings.sum() * 0.0
         arcface = (
             self.arcface(embeddings, labels)
             if self.arcface is not None
             else embeddings.sum() * 0.0
         )
-        total = (
-            triplet
-            + self.lambda_intra * intra
-            + self.lambda_inter * inter
-            + self.lambda_arcface * arcface
+        component_losses = torch.stack((triplet, intra, inter, diversity))
+        base_weights = component_losses.new_tensor(
+            (1.0, self.lambda_intra, self.lambda_inter, self.lambda_diversity)
         )
-        return {
+        if self.loss_balancer is not None:
+            total, effective_weights = self.loss_balancer(
+                component_losses, base_weights
+            )
+        else:
+            effective_weights = base_weights
+            total = (base_weights * component_losses).sum()
+        total = total + self.lambda_arcface * arcface
+        result = {
             "total": total,
             "triplet": triplet,
             "intra": intra,
             "inter": inter,
             "arcface": arcface,
+            "diversity": diversity,
         }
+        for name, weight in zip(
+            ("triplet", "intra", "inter", "diversity"),
+            effective_weights,
+            strict=True,
+        ):
+            result[f"weight_{name}"] = weight
+        return result

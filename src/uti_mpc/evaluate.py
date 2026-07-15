@@ -21,6 +21,7 @@ from uti_mpc.engine.runtime import build_loaders, load_dataset_and_split
 from uti_mpc.metrics.open_set import (
     calibrate_auxiliary_rejection,
     calibrate_open_set,
+    calibrate_subprototype_open_set,
     class_conditional_knn_scores,
     class_distance_diagnostics,
     compute_open_set_metrics,
@@ -160,23 +161,43 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
     )
     test_buckets = packet_counts_to_buckets(test_packet_counts, bucket_edges)
     length_conditioned = bool(evaluation_config.get("length_conditioned_prototypes", False))
-    artifacts = calibrate_open_set(
-        train_features,
-        train_labels,
-        split.known_classes,
-        quantile=float(evaluation_config.get("threshold_quantile", 0.95)),
-        buckets=train_buckets if length_conditioned else None,
-        bucket_values=list(range(len(bucket_edges) + 1)) if length_conditioned else None,
-        calibration_features=validation_features,
-        calibration_labels=validation_labels,
-        calibration_buckets=validation_buckets if length_conditioned else None,
-        minimum_calibration_samples=int(
-            evaluation_config.get("minimum_threshold_samples", 5)
-        ),
-        use_train_threshold_floor=bool(
-            evaluation_config.get("use_train_threshold_floor", True)
-        ),
-    )
+    subprototype_count = int(evaluation_config.get("subprototypes_per_class", 1))
+    if subprototype_count > 1:
+        if length_conditioned:
+            raise ValueError("Subprototypes and length-conditioned prototypes are mutually exclusive")
+        artifacts = calibrate_subprototype_open_set(
+            train_features,
+            train_labels,
+            split.known_classes,
+            subprototypes_per_class=subprototype_count,
+            quantile=float(evaluation_config.get("threshold_quantile", 0.95)),
+            calibration_features=validation_features,
+            calibration_labels=validation_labels,
+            minimum_calibration_samples=int(
+                evaluation_config.get("minimum_threshold_samples", 5)
+            ),
+            use_train_threshold_floor=bool(
+                evaluation_config.get("use_train_threshold_floor", True)
+            ),
+        )
+    else:
+        artifacts = calibrate_open_set(
+            train_features,
+            train_labels,
+            split.known_classes,
+            quantile=float(evaluation_config.get("threshold_quantile", 0.95)),
+            buckets=train_buckets if length_conditioned else None,
+            bucket_values=list(range(len(bucket_edges) + 1)) if length_conditioned else None,
+            calibration_features=validation_features,
+            calibration_labels=validation_labels,
+            calibration_buckets=validation_buckets if length_conditioned else None,
+            minimum_calibration_samples=int(
+                evaluation_config.get("minimum_threshold_samples", 5)
+            ),
+            use_train_threshold_floor=bool(
+                evaluation_config.get("use_train_threshold_floor", True)
+            ),
+        )
     predictions, distances = predict_open_set(
         test_features, artifacts, buckets=test_buckets if length_conditioned else None
     )
@@ -184,7 +205,18 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
     prototypes = artifacts["prototypes"].to(test_features.device)
     prototype_classes = artifacts["classes"].to(test_features.device)
     thresholds = artifacts["thresholds"].to(test_features.device)
-    if length_conditioned:
+    if subprototype_count > 1:
+        flat_distances = squared_distances(test_features, prototypes.flatten(0, 1))
+        nearest_distances, nearest_prototype_positions = flat_distances.min(dim=1)
+        nearest_class_positions = torch.div(
+            nearest_prototype_positions, subprototype_count, rounding_mode="floor"
+        )
+        nearest_classes = prototype_classes[nearest_class_positions]
+        nearest_thresholds = thresholds.flatten()[nearest_prototype_positions]
+        all_class_distances = flat_distances.reshape(
+            len(test_features), len(prototype_classes), subprototype_count
+        ).amin(dim=2)
+    elif length_conditioned:
         bucket_values = artifacts["bucket_values"].to(test_features.device)
         matches = test_buckets.to(test_features.device)[:, None] == bucket_values[None, :]
         if not matches.any(dim=1).all():
@@ -193,12 +225,21 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
         selected_prototypes = prototypes[:, bucket_positions, :].permute(1, 0, 2)
         all_distances = (test_features[:, None, :] - selected_prototypes).square().sum(dim=2)
         per_sample_thresholds = thresholds[:, bucket_positions].transpose(0, 1)
+        nearest_distances, nearest_class_positions = all_distances.min(dim=1)
+        nearest_classes = prototype_classes[nearest_class_positions]
+        nearest_thresholds = per_sample_thresholds.gather(
+            1, nearest_class_positions[:, None]
+        ).squeeze(1)
+        all_class_distances = all_distances
     else:
         all_distances = squared_distances(test_features, prototypes)
         per_sample_thresholds = thresholds.unsqueeze(0).expand(len(test_features), -1)
-    nearest_distances, nearest_positions = all_distances.min(dim=1)
-    nearest_classes = prototype_classes[nearest_positions]
-    nearest_thresholds = per_sample_thresholds.gather(1, nearest_positions[:, None]).squeeze(1)
+        nearest_distances, nearest_class_positions = all_distances.min(dim=1)
+        nearest_classes = prototype_classes[nearest_class_positions]
+        nearest_thresholds = per_sample_thresholds.gather(
+            1, nearest_class_positions[:, None]
+        ).squeeze(1)
+        all_class_distances = all_distances
     nearest_thresholds = nearest_thresholds.clamp_min(torch.finfo(thresholds.dtype).eps)
     threshold_ratios = nearest_distances / nearest_thresholds
     metrics = _decision_metrics(
@@ -227,9 +268,16 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
         classes_on_device = artifacts["classes"].to(auxiliary_device)
         prototypes_on_device = artifacts["prototypes"].to(auxiliary_device)
         validation_features_on_device = validation_features.to(auxiliary_device)
-        validation_distances = squared_distances(
-            validation_features_on_device, prototypes_on_device
-        )
+        if subprototype_count > 1:
+            validation_distances = squared_distances(
+                validation_features_on_device, prototypes_on_device.flatten(0, 1)
+            ).reshape(
+                len(validation_features), len(classes_on_device), subprototype_count
+            ).amin(dim=2)
+        else:
+            validation_distances = squared_distances(
+                validation_features_on_device, prototypes_on_device
+            )
         auxiliary_artifacts = calibrate_auxiliary_rejection(
             validation_features_on_device,
             validation_labels.to(auxiliary_device),
@@ -248,7 +296,7 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
         )
         test_features_on_device = test_features.to(auxiliary_device)
         nearest_classes_on_device = nearest_classes.to(auxiliary_device)
-        nearest_positions_on_device = nearest_positions.to(auxiliary_device)
+        nearest_positions_on_device = nearest_class_positions.to(auxiliary_device)
         test_knn_scores = class_conditional_knn_scores(
             test_features_on_device,
             nearest_classes_on_device,
@@ -258,7 +306,7 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
             chunk_size=int(evaluation_config.get("knn_chunk_size", 1024)),
         )
         test_margin_ratios = prototype_distance_ratios(
-            all_distances.to(auxiliary_device)
+            all_class_distances.to(auxiliary_device)
         )
         test_knn_thresholds = auxiliary_artifacts["knn_thresholds"].to(
             auxiliary_device
@@ -335,6 +383,8 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
     def source_label(code: int) -> str:
         if code == 1:
             return "validation"
+        if code == 2:
+            return "validation_class_fallback"
         return "train_fallback" if threshold_source == "validation" else "train"
 
     serializable = {
@@ -351,8 +401,20 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
             evaluation_config.get("use_train_threshold_floor", True)
         ),
         "length_conditioned_prototypes": length_conditioned,
+        "subprototypes_per_class": subprototype_count,
         "flow_length_bucket_edges": list(bucket_edges),
         "thresholds": (
+            {
+                str(int(label)): {
+                    f"subprototype_{index + 1}": float(value)
+                    for index, value in enumerate(row.tolist())
+                }
+                for label, row in zip(
+                    artifacts["classes"], artifacts["thresholds"], strict=True
+                )
+            }
+            if subprototype_count > 1
+            else
             {
                 str(int(label)): {
                     flow_length_bucket_name(bucket, bucket_edges): float(value)
@@ -373,6 +435,15 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
         "threshold_calibration_counts": (
             {
                 str(int(label)): {
+                    f"subprototype_{index + 1}": int(value)
+                    for index, value in enumerate(row.tolist())
+                }
+                for label, row in zip(artifacts["classes"], sample_counts, strict=True)
+            }
+            if subprototype_count > 1
+            else
+            {
+                str(int(label)): {
                     flow_length_bucket_name(bucket, bucket_edges): int(value)
                     for bucket, value in enumerate(row.tolist())
                 }
@@ -385,6 +456,15 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
             }
         ),
         "threshold_sources": (
+            {
+                str(int(label)): {
+                    f"subprototype_{index + 1}": source_label(int(value))
+                    for index, value in enumerate(row.tolist())
+                }
+                for label, row in zip(artifacts["classes"], source_codes, strict=True)
+            }
+            if subprototype_count > 1
+            else
             {
                 str(int(label)): {
                     flow_length_bucket_name(bucket, bucket_edges): source_label(int(value))

@@ -128,6 +128,145 @@ def compute_prototypes(
     return torch.stack(prototypes), class_tensor
 
 
+def compute_subprototypes(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    known_classes: Sequence[int],
+    subprototypes_per_class: int = 3,
+    iterations: int = 20,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic spherical k-means prototypes for each known class."""
+    if subprototypes_per_class < 2:
+        raise ValueError("subprototypes_per_class must be at least 2")
+    classes = torch.tensor(sorted(known_classes), dtype=torch.long, device=labels.device)
+    class_prototypes = []
+    for label in classes:
+        selected = torch.nn.functional.normalize(features[labels == label].float(), dim=1)
+        if len(selected) < subprototypes_per_class:
+            raise ValueError(
+                f"Known class {int(label)} has fewer samples than requested subprototypes"
+            )
+        # Farthest-first initialization is deterministic and avoids seed-sensitive
+        # cluster collapse on rare traffic classes.
+        first = (selected - selected.mean(dim=0, keepdim=True)).square().sum(dim=1).argmin()
+        center_indices = [int(first)]
+        minimum_distances = squared_distances(selected, selected[first : first + 1]).squeeze(1)
+        for _ in range(1, subprototypes_per_class):
+            next_index = int(minimum_distances.argmax())
+            center_indices.append(next_index)
+            candidate = squared_distances(
+                selected, selected[next_index : next_index + 1]
+            ).squeeze(1)
+            minimum_distances = torch.minimum(minimum_distances, candidate)
+        centers = selected[center_indices]
+        for _ in range(iterations):
+            distances = squared_distances(selected, centers)
+            assignments = distances.argmin(dim=1)
+            updated = []
+            for position in range(subprototypes_per_class):
+                members = selected[assignments == position]
+                updated.append(
+                    torch.nn.functional.normalize(members.mean(dim=0), dim=0)
+                    if len(members)
+                    else centers[position]
+                )
+            next_centers = torch.stack(updated)
+            if torch.allclose(next_centers, centers, atol=1e-5, rtol=1e-4):
+                centers = next_centers
+                break
+            centers = next_centers
+        class_prototypes.append(centers)
+    return torch.stack(class_prototypes), classes
+
+
+def calibrate_subprototype_open_set(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    known_classes: Sequence[int],
+    subprototypes_per_class: int = 3,
+    quantile: float = 0.95,
+    calibration_features: torch.Tensor | None = None,
+    calibration_labels: torch.Tensor | None = None,
+    minimum_calibration_samples: int = 5,
+    use_train_threshold_floor: bool = True,
+) -> dict[str, torch.Tensor]:
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError("quantile must be between 0 and 1")
+    prototypes, classes = compute_subprototypes(
+        features, labels, known_classes, subprototypes_per_class
+    )
+    flat_prototypes = prototypes.flatten(0, 1)
+    train_distances = squared_distances(features, flat_prototypes)
+    train_thresholds = torch.empty(
+        prototypes.shape[:2], dtype=torch.float32, device=features.device
+    )
+    train_counts = torch.zeros_like(train_thresholds, dtype=torch.long)
+    for class_position, label in enumerate(classes):
+        class_distances = train_distances[labels == label]
+        start = class_position * subprototypes_per_class
+        own_distances = class_distances[:, start : start + subprototypes_per_class]
+        class_assignments = own_distances.argmin(dim=1)
+        class_fallback = torch.quantile(own_distances.amin(dim=1), quantile)
+        for subcenter in range(subprototypes_per_class):
+            selected = own_distances[class_assignments == subcenter, subcenter]
+            train_counts[class_position, subcenter] = len(selected)
+            train_thresholds[class_position, subcenter] = (
+                torch.quantile(selected, quantile) if len(selected) else class_fallback
+            )
+
+    thresholds = train_thresholds.clone()
+    sample_counts = train_counts.clone()
+    source_codes = torch.zeros_like(train_counts)
+    if calibration_features is not None:
+        if calibration_labels is None or len(calibration_features) != len(calibration_labels):
+            raise ValueError("Held-out calibration features and labels must match")
+        calibration_distances = squared_distances(calibration_features, flat_prototypes)
+        assignments = calibration_distances.argmin(dim=1)
+        class_positions = torch.div(
+            assignments, subprototypes_per_class, rounding_mode="floor"
+        )
+        predicted = classes[class_positions]
+        nearest = calibration_distances.gather(1, assignments[:, None]).squeeze(1)
+        for class_position, label in enumerate(classes):
+            correct_class = (calibration_labels == label) & (predicted == label)
+            class_values = nearest[correct_class]
+            class_threshold = (
+                torch.quantile(class_values, quantile)
+                if len(class_values) >= minimum_calibration_samples
+                else None
+            )
+            for subcenter in range(subprototypes_per_class):
+                flat_position = class_position * subprototypes_per_class + subcenter
+                selected = nearest[correct_class & (assignments == flat_position)]
+                sample_counts[class_position, subcenter] = len(selected)
+                candidate = None
+                code = 0
+                if len(selected) >= minimum_calibration_samples:
+                    candidate = torch.quantile(selected, quantile)
+                    code = 1
+                elif class_threshold is not None:
+                    candidate = class_threshold
+                    code = 2
+                if candidate is None:
+                    continue
+                thresholds[class_position, subcenter] = (
+                    torch.maximum(candidate, train_thresholds[class_position, subcenter])
+                    if use_train_threshold_floor
+                    else candidate
+                )
+                source_codes[class_position, subcenter] = code
+    return {
+        "prototypes": prototypes.cpu(),
+        "classes": classes.cpu(),
+        "thresholds": thresholds.cpu(),
+        "train_thresholds": train_thresholds.cpu(),
+        "threshold_sample_counts": sample_counts.cpu(),
+        "threshold_source_codes": source_codes.cpu(),
+        "subprototypes_per_class": torch.tensor(subprototypes_per_class),
+        "quantile": torch.tensor(quantile),
+    }
+
+
 def _bucket_positions(assignments: torch.Tensor, bucket_values: torch.Tensor) -> torch.Tensor:
     matches = assignments.to(bucket_values.device)[:, None] == bucket_values[None, :]
     if not matches.any(dim=1).all():
@@ -353,6 +492,18 @@ def predict_open_set(
     prototypes = artifacts["prototypes"].to(features.device)
     classes = artifacts["classes"].to(features.device)
     thresholds = artifacts["thresholds"].to(features.device)
+    if "subprototypes_per_class" in artifacts:
+        count = int(artifacts["subprototypes_per_class"])
+        distances = squared_distances(features, prototypes.flatten(0, 1))
+        nearest_distance, nearest_position = distances.min(dim=1)
+        class_positions = torch.div(nearest_position, count, rounding_mode="floor")
+        predicted = classes[class_positions]
+        selected_thresholds = thresholds.flatten()[nearest_position]
+        accepted = nearest_distance <= selected_thresholds
+        predicted = torch.where(
+            accepted, predicted, torch.full_like(predicted, unknown_label)
+        )
+        return predicted, nearest_distance
     if "bucket_values" in artifacts:
         if buckets is None:
             raise ValueError("Flow-length buckets are required by conditional prototypes")

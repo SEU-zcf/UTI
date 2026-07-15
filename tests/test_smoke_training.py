@@ -45,6 +45,8 @@ data:
   cache_dir: {cache}
   flow_length_bucket_edges: [1, 2, 8]
 model:
+  hierarchical_bgi: true
+  cross_modal_fusion: true
   byte_embedding_dim: 8
   branch_channels: 4
   byte_dim: 16
@@ -56,6 +58,11 @@ model:
   ffn_expansion: 2
   dropout: 0.0
   max_length: 8
+  byte_attention_heads: 4
+  byte_packet_layers: 1
+  cross_modal_dim: 16
+  cross_attention_heads: 4
+  max_packets: 8
 split:
   known_classes: [1, 2]
   unknown_classes: [3]
@@ -69,6 +76,10 @@ loss:
   lambda_arcface: 0.1
   arcface_scale: 16.0
   arcface_margin: 0.2
+  subcenters_per_class: 3
+  lambda_diversity: 0.1
+  subcenter_diversity_margin: 0.2
+  loss_weighting: ema
 train:
   output_dir: {output}
   seed: 42
@@ -140,3 +151,16 @@ evaluation:
         "prototype_knn_margin",
     }
     assert (output / "evaluation" / "auxiliary_predictions.csv").exists()
+
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "knn_chunk_size: 8", "knn_chunk_size: 8\n  subprototypes_per_class: 2"
+        ),
+        encoding="utf-8",
+    )
+    subprototype_metrics = evaluate(config, best)
+    assert subprototype_metrics["subprototypes_per_class"] == 2
+    assert all(
+        set(class_thresholds) == {"subprototype_1", "subprototype_2"}
+        for class_thresholds in subprototype_metrics["thresholds"].values()
+    )
