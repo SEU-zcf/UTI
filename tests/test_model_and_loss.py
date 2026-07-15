@@ -93,17 +93,19 @@ def test_v2_hierarchical_cross_modal_model_masks_padding_and_backpropagates():
             "dropout": 0.0,
             "max_length": 16,
             "max_packets": 16,
+            "byte_width": 64,
+            "temporal_input_dim": 13,
             "twt_depth": 2,
             "shifted_windows": True,
         }
     )
-    byte_tokens = torch.randint(0, 256, (2, 8, 32))
+    byte_tokens = torch.randint(0, 256, (2, 8, 64))
     byte_mask = torch.tensor(
         [[True] * 8, [True, True, False, False, False, False, False, False]]
     )
     altered = byte_tokens.clone()
     altered[1, 2:] = torch.randint(0, 256, altered[1, 2:].shape)
-    lengths = torch.randn(2, 4)
+    lengths = torch.randn(2, 4, 13)
     length_mask = torch.tensor([[True] * 4, [True, True, False, False]])
     model.eval()
     first, details = model(byte_tokens, lengths, byte_mask, length_mask, True)

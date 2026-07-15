@@ -28,7 +28,7 @@ class _FlowState:
     start: float
     last: float
     byte_rows: list[bytes] = field(default_factory=list)
-    lengths: list[float] = field(default_factory=list)
+    lengths: list[float | np.ndarray] = field(default_factory=list)
     packets: int = 0
     byte_count: int = 0
     background_reason: str | None = None
@@ -64,8 +64,12 @@ def _canonical_key(
     return (left, right, protocol) if left <= right else (right, left, protocol)
 
 
-def packet_feature(ip: dpkt.ip.IP) -> tuple[bytes, int, int, bytes, int] | None:
-    """Return 32-byte semantic row plus endpoints and IP total length."""
+def packet_feature(
+    ip: dpkt.ip.IP, payload_bytes: int = 3, byte_width: int = 32
+) -> tuple[bytes, int, int, bytes, int, int, int, bool] | None:
+    """Return a semantic byte row plus endpoints and temporal metadata."""
+    if payload_bytes < 0 or byte_width < 28 + payload_bytes:
+        raise ValueError("byte_width must fit 28 header bytes and the configured payload")
     raw_ip = bytes(ip)
     if len(raw_ip) < 20 or not isinstance(ip.data, (dpkt.tcp.TCP, dpkt.udp.UDP)):
         return None
@@ -75,24 +79,51 @@ def packet_feature(ip: dpkt.ip.IP) -> tuple[bytes, int, int, bytes, int] | None:
             return None
         offset = max(20, ((transport[12] >> 4) & 0x0F) * 4)
         control = transport[4:20]
-        payload = transport[offset : offset + 3]
+        payload_data = transport[offset:]
+        tcp_flags = int(ip.data.flags)
+        is_tcp = True
     else:
         if len(transport) < 8:
             return None
         control = transport[4:8] + bytes(12)
-        payload = transport[8:11]
-    row = raw_ip[:12] + control.ljust(16, b"\x00")[:16] + payload.ljust(3, b"\x00") + b"\x00"
+        payload_data = transport[8:]
+        tcp_flags = 0
+        is_tcp = False
+    payload = payload_data[:payload_bytes]
+    row = (
+        raw_ip[:12]
+        + control.ljust(16, b"\x00")[:16]
+        + payload.ljust(payload_bytes, b"\x00")
+    ).ljust(byte_width, b"\x00")[:byte_width]
     total_length = int(ip.len) if int(ip.len) > 0 else len(raw_ip)
-    return row, int(ip.data.sport), int(ip.data.dport), ip.src, total_length
+    return (
+        row,
+        int(ip.data.sport),
+        int(ip.data.dport),
+        ip.src,
+        total_length,
+        len(payload_data),
+        tcp_flags,
+        is_tcp,
+    )
 
 
-def _finalize(state: _FlowState, npackets: int, nlengths: int) -> FlowFeatures:
-    byte_tokens = np.zeros((npackets, 32), dtype=np.uint8)
+def _finalize(
+    state: _FlowState,
+    npackets: int,
+    nlengths: int,
+    byte_width: int,
+    temporal_features: int,
+) -> FlowFeatures:
+    byte_tokens = np.zeros((npackets, byte_width), dtype=np.uint8)
     byte_mask = np.zeros(npackets, dtype=np.bool_)
     for index, row in enumerate(state.byte_rows[:npackets]):
         byte_tokens[index] = np.frombuffer(row, dtype=np.uint8)
         byte_mask[index] = True
-    length_direction = np.zeros(nlengths, dtype=np.float32)
+    length_direction = np.zeros(
+        (nlengths, temporal_features) if temporal_features > 1 else nlengths,
+        dtype=np.float32,
+    )
     length_mask = np.zeros(nlengths, dtype=np.bool_)
     count = min(len(state.lengths), nlengths)
     if count:
@@ -108,6 +139,8 @@ def _finish_state(
     nlengths: int,
     min_packets: int,
     audit: FlowAudit | None,
+    byte_width: int,
+    temporal_features: int,
 ) -> FlowFeatures | None:
     reason = state.background_reason
     if state.packets < min_packets:
@@ -116,7 +149,7 @@ def _finish_state(
         audit.record(state.packets, state.byte_count, reason)
     if reason is not None:
         return None
-    return _finalize(state, npackets, nlengths)
+    return _finalize(state, npackets, nlengths, byte_width, temporal_features)
 
 
 def iter_capture_flows(
@@ -127,7 +160,18 @@ def iter_capture_flows(
     min_packets: int = 1,
     background_filter: BackgroundFlowFilter | None = None,
     audit: FlowAudit | None = None,
+    payload_bytes: int = 3,
+    byte_width: int = 32,
+    rich_temporal_features: bool = False,
+    iat_clip: float = 60.0,
 ) -> Iterator[FlowFeatures]:
+    if npackets < 1 or nlengths < 1:
+        raise ValueError("npackets and nlengths must be positive")
+    if payload_bytes < 0 or byte_width < 28 + payload_bytes:
+        raise ValueError("byte_width must fit 28 header bytes and the configured payload")
+    if iat_clip <= 0:
+        raise ValueError("iat_clip must be positive")
+    temporal_features = 13 if rich_temporal_features else 1
     active: dict[tuple, _FlowState] = {}
     with Path(capture).open("rb") as handle:
         reader = _reader(handle)
@@ -137,18 +181,37 @@ def iter_capture_flows(
                 ip = _network_packet(buffer, datalink)
                 if not isinstance(ip, dpkt.ip.IP) or ip.mf or ip.offset:
                     continue
-                parsed = packet_feature(ip)
+                parsed = packet_feature(
+                    ip, payload_bytes=payload_bytes, byte_width=byte_width
+                )
             except (dpkt.dpkt.UnpackError, ValueError, IndexError):
                 continue
             if parsed is None:
                 continue
-            row, sport, dport, src, total_length = parsed
+            (
+                row,
+                sport,
+                dport,
+                src,
+                total_length,
+                payload_length,
+                tcp_flags,
+                is_tcp,
+            ) = parsed
             dst = ip.dst
             protocol = int(ip.p)
             key = _canonical_key(src, sport, dst, dport, protocol)
             state = active.get(key)
             if state is not None and timestamp - state.last > idle_timeout:
-                finished = _finish_state(state, npackets, nlengths, min_packets, audit)
+                finished = _finish_state(
+                    state,
+                    npackets,
+                    nlengths,
+                    min_packets,
+                    audit,
+                    byte_width,
+                    temporal_features,
+                )
                 if finished is not None:
                     yield finished
                 state = None
@@ -169,11 +232,40 @@ def iter_capture_flows(
             if len(state.byte_rows) < npackets:
                 state.byte_rows.append(row)
             if len(state.lengths) < nlengths:
-                state.lengths.append(direction * min(total_length, 1500) / 1500.0)
+                if rich_temporal_features:
+                    iat = (
+                        0.0
+                        if state.packets == 0
+                        else max(0.0, float(timestamp) - state.last)
+                    )
+                    flags = [float(bool(tcp_flags & (1 << bit))) for bit in range(8)]
+                    state.lengths.append(
+                        np.asarray(
+                            [
+                                np.log1p(min(total_length, 1500)) / np.log1p(1500),
+                                direction,
+                                np.log1p(min(iat, iat_clip)) / np.log1p(iat_clip),
+                                min(payload_length / max(total_length, 1), 1.0),
+                                float(is_tcp),
+                                *flags,
+                            ],
+                            dtype=np.float32,
+                        )
+                    )
+                else:
+                    state.lengths.append(direction * min(total_length, 1500) / 1500.0)
             state.last = float(timestamp)
             state.packets += 1
             state.byte_count += total_length
     for state in active.values():
-        finished = _finish_state(state, npackets, nlengths, min_packets, audit)
+        finished = _finish_state(
+            state,
+            npackets,
+            nlengths,
+            min_packets,
+            audit,
+            byte_width,
+            temporal_features,
+        )
         if finished is not None:
             yield finished

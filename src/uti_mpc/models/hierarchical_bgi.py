@@ -39,13 +39,21 @@ class HierarchicalBGICNN(nn.Module):
         packet_layers: int = 2,
         dropout: float = 0.1,
         max_packets: int = 64,
+        byte_width: int = 32,
     ) -> None:
         super().__init__()
         if packet_layers < 1:
             raise ValueError("packet_layers must be positive")
+        if byte_width < 28:
+            raise ValueError("byte_width must include the 28 header-control bytes")
+        self.byte_width = byte_width
         self.byte_embedding = nn.Embedding(256, byte_embedding_dim)
-        self.byte_position = nn.Parameter(torch.zeros(1, 1, 32, byte_embedding_dim))
-        field_ids = torch.tensor([0] * 12 + [1] * 16 + [2] * 4, dtype=torch.long)
+        self.byte_position = nn.Parameter(
+            torch.zeros(1, 1, byte_width, byte_embedding_dim)
+        )
+        field_ids = torch.tensor(
+            [0] * 12 + [1] * 16 + [2] * (byte_width - 28), dtype=torch.long
+        )
         self.register_buffer("field_ids", field_ids, persistent=False)
         self.field_embedding = nn.Embedding(3, byte_embedding_dim)
         self.input_projection = nn.Linear(byte_embedding_dim, dim)
@@ -79,8 +87,10 @@ class HierarchicalBGICNN(nn.Module):
     def forward(
         self, byte_tokens: torch.Tensor, byte_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        if byte_tokens.ndim != 3 or byte_tokens.shape[-1] != 32:
-            raise ValueError("byte_tokens must have shape [batch, packets, 32]")
+        if byte_tokens.ndim != 3 or byte_tokens.shape[-1] != self.byte_width:
+            raise ValueError(
+                f"byte_tokens must have shape [batch, packets, {self.byte_width}]"
+            )
         if byte_tokens.shape[:2] != byte_mask.shape:
             raise ValueError("byte mask does not match byte tokens")
         batch, packets, width = byte_tokens.shape

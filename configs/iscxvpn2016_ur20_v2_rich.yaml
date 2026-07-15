@@ -1,0 +1,22 @@
+extends: iscxvpn2016_ur20_v2.yaml
+
+# Main preprocessing upgrade: retain the conservative infrastructure filter,
+# but expose substantially more application content and packet-level timing.
+data:
+  cache_dir: data/processed/iscxvpn2016_sanitized_rich
+  np: 64
+  nl: 64
+  payload_bytes: 32
+  byte_width: 64
+  temporal_mode: rich
+  iat_clip: 60.0
+
+model:
+  byte_width: 64
+  max_packets: 64
+  temporal_input_dim: 13
+  max_length: 64
+
+train:
+  output_dir: outputs/iscxvpn2016_ur20_v2_rich
+

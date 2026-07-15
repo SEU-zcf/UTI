@@ -1,0 +1,12 @@
+extends: iscxvpn2016_ur20_v2_rich.yaml
+
+# Controlled ablation only. This keeps all valid IPv4 TCP/UDP flows, including
+# capture-level mislabeled infrastructure traffic, in an isolated cache.
+data:
+  cache_dir: data/processed/iscxvpn2016_rich_raw
+  background_filter:
+    enabled: false
+
+train:
+  output_dir: outputs/iscxvpn2016_ur20_v2_rich_raw
+

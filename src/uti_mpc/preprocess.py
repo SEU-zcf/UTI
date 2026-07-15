@@ -40,11 +40,18 @@ def preprocess(
         raise FileNotFoundError(f"No .pcap or .pcapng files found under {root}")
     resolver = LabelResolver(root, label_map)
     data_config = config["data"]
+    temporal_mode = str(data_config.get("temporal_mode", "signed_length"))
+    if temporal_mode not in {"signed_length", "rich"}:
+        raise ValueError("data.temporal_mode must be 'signed_length' or 'rich'")
+    payload_bytes = int(data_config.get("payload_bytes", 3))
+    byte_width = int(data_config.get("byte_width", 32))
+    iat_clip = float(data_config.get("iat_clip", 60.0))
+    temporal_features = 13 if temporal_mode == "rich" else 1
     background_filter = BackgroundFlowFilter.from_config(
         data_config.get("background_filter", {})
     )
     manifest: dict = {
-        "version": 1,
+        "version": 2,
         "dataset": "ISCXVPN2016",
         "source_root": str(root),
         "class_map": {str(key): value for key, value in ISCXVPN2016_CLASSES.items()},
@@ -53,7 +60,12 @@ def preprocess(
             "nl": int(data_config["nl"]),
             "idle_timeout": float(data_config["idle_timeout"]),
             "min_packets": int(data_config.get("min_packets", 1)),
+            "byte_width": byte_width,
+            "payload_bytes": payload_bytes,
             "length_mode": "ipv4_total_length",
+            "temporal_mode": temporal_mode,
+            "temporal_features": temporal_features,
+            "iat_clip": iat_clip,
             "background_filter": (
                 background_filter.to_dict() if background_filter is not None else {"enabled": False}
             ),
@@ -75,6 +87,10 @@ def preprocess(
                 min_packets=int(data_config.get("min_packets", 1)),
                 background_filter=background_filter,
                 audit=capture_audit,
+                payload_bytes=payload_bytes,
+                byte_width=byte_width,
+                rich_temporal_features=temporal_mode == "rich",
+                iat_clip=iat_clip,
             )
         )
         if capture_audit is not None:

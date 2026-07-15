@@ -197,6 +197,31 @@ CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.evaluate \
   --checkpoint outputs/iscxvpn2016_ur20_v2/best.pt
 ```
 
+#### Rich packet/temporal preprocessing
+
+`iscxvpn2016_ur20_v2_rich.yaml` is the main V2 preprocessing upgrade. Each
+flow now keeps 64 packets, 32 application-payload bytes per packet in a
+64-byte semantic row, and 13 temporal/protocol features per packet: normalized
+log length, direction, normalized log inter-arrival time, payload ratio,
+TCP/UDP type, and eight TCP flag bits. Source/destination IP addresses and
+transport ports remain excluded from model input. This cache is intentionally
+separate from every earlier experiment.
+
+```bash
+python -m uti_mpc.preprocess \
+  --config configs/iscxvpn2016_ur20_v2_rich.yaml \
+  --pcap-root /path/to/ISCX-VPN-NonVPN-2016
+
+CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.train \
+  --config configs/iscxvpn2016_ur20_v2_rich.yaml
+```
+
+For a controlled comparison, `iscxvpn2016_ur20_v2_rich_raw.yaml` uses the
+same features and model but disables infrastructure-flow filtering. It writes
+both cache and checkpoints to different paths. Treat it as an ablation: those
+extra flows contain very few packets/bytes and inherit capture-level labels,
+so its headline accuracy is not directly comparable to the sanitized result.
+
 ### Flow-length conditional experiments
 
 The `*_length_conditional.yaml` configurations retain every short flow. They

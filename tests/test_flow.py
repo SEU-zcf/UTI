@@ -66,6 +66,49 @@ def test_raw_ip_linktype_101_is_supported(tmp_path: Path):
     assert flows[0].byte_mask.tolist() == [True, False, False, False]
 
 
+def test_rich_packet_content_and_temporal_features(tmp_path: Path):
+    capture = tmp_path / "rich.pcap"
+    left = b"\x0a\x00\x00\x01"
+    right = b"\x0a\x00\x00\x02"
+    first_payload = bytes(range(40))
+    second_payload = b"response" * 5
+    with capture.open("wb") as handle:
+        writer = dpkt.pcap.Writer(handle)
+        writer.writepkt(
+            _ethernet_packet(left, right, 1111, 443, first_payload), ts=1.0
+        )
+        writer.writepkt(
+            _ethernet_packet(right, left, 443, 1111, second_payload), ts=3.0
+        )
+        writer.close()
+
+    flows = list(
+        iter_capture_flows(
+            capture,
+            npackets=4,
+            nlengths=4,
+            payload_bytes=32,
+            byte_width=64,
+            rich_temporal_features=True,
+        )
+    )
+    assert len(flows) == 1
+    flow = flows[0]
+    assert flow.byte_tokens.shape == (4, 64)
+    assert bytes(flow.byte_tokens[0, 28:60]) == first_payload[:32]
+    assert bytes(flow.byte_tokens[0, 60:64]) == bytes(4)
+    assert flow.length_direction.shape == (4, 13)
+    assert flow.length_direction[0, 1] == 1.0
+    assert flow.length_direction[1, 1] == -1.0
+    assert flow.length_direction[0, 2] == 0.0
+    assert flow.length_direction[1, 2] > 0.0
+    assert flow.length_direction[0, 3] > 0.0
+    assert flow.length_direction[0, 4] == 1.0
+    # TH_ACK is bit four; flag features occupy columns 5 through 12.
+    assert flow.length_direction[0, 9] == 1.0
+    assert not flow.length_mask[2]
+
+
 def test_background_protocol_filter_keeps_application_flow_and_audits_dns(tmp_path: Path):
     capture = tmp_path / "mixed.pcap"
     left = b"\x0a\x00\x00\x01"

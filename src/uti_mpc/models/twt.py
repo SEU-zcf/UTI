@@ -164,11 +164,15 @@ class TWT(nn.Module):
         max_length: int = 512,
         depth: int = 1,
         shifted_windows: bool = False,
+        input_features: int = 1,
     ) -> None:
         super().__init__()
         if depth < 1:
             raise ValueError("depth must be positive")
-        self.input_projection = nn.Linear(1, dim)
+        if input_features < 1:
+            raise ValueError("input_features must be positive")
+        self.input_features = input_features
+        self.input_projection = nn.Linear(input_features, dim)
         self.position = SinusoidalPositionEncoding(dim, max_length)
         self.depth = depth
         # Keep the original attribute name and state-dict layout for the baseline
@@ -195,7 +199,21 @@ class TWT(nn.Module):
         length_mask: torch.Tensor,
         return_tokens: bool = False,
     ):
-        x = self.input_projection(length_direction.unsqueeze(-1))
+        if length_direction.ndim == 2:
+            temporal = length_direction.unsqueeze(-1)
+        elif length_direction.ndim == 3:
+            temporal = length_direction
+        else:
+            raise ValueError(
+                "length_direction must have shape [batch, packets] or "
+                "[batch, packets, features]"
+            )
+        if temporal.shape[-1] != self.input_features:
+            raise ValueError(
+                f"Expected {self.input_features} temporal features, got "
+                f"{temporal.shape[-1]}"
+            )
+        x = self.input_projection(temporal)
         x = self.position(x)
         x = x.masked_fill(~length_mask.unsqueeze(-1), 0.0)
         if self.depth == 1:

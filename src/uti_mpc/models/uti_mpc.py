@@ -31,6 +31,7 @@ class UTIMPC(nn.Module):
                 packet_layers=int(config.get("byte_packet_layers", 2)),
                 dropout=dropout,
                 max_packets=int(config.get("max_packets", 64)),
+                byte_width=int(config.get("byte_width", 32)),
             )
         else:
             self.bgi_cnn = BGICNN(
@@ -49,6 +50,7 @@ class UTIMPC(nn.Module):
             max_length=int(config.get("max_length", 512)),
             depth=int(config.get("twt_depth", 1)),
             shifted_windows=bool(config.get("shifted_windows", False)),
+            input_features=int(config.get("temporal_input_dim", 1)),
         )
         if self.use_cross_modal_fusion:
             cross_dim = int(config.get("cross_modal_dim", 128))
