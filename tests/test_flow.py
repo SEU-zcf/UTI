@@ -136,6 +136,40 @@ def test_background_protocol_filter_keeps_application_flow_and_audits_dns(tmp_pa
     assert audit.reason_flows["udp_port_53"] == 1
 
 
+def test_v3_payload_masks_stable_features_and_bursts(tmp_path: Path):
+    capture = tmp_path / "v3.pcap"
+    left = b"\x0a\x00\x00\x01"
+    right = b"\x0a\x00\x00\x02"
+    first = b"\x00\x01secret"
+    with capture.open("wb") as handle:
+        writer = dpkt.pcap.Writer(handle)
+        writer.writepkt(_ethernet_packet(left, right, 1111, 443, first), ts=1.0)
+        writer.writepkt(_ethernet_packet(left, right, 1111, 443, b"next"), ts=1.5)
+        writer.writepkt(_ethernet_packet(right, left, 443, 1111, b"reply"), ts=2.0)
+        writer.close()
+    flow = next(
+        iter_capture_flows(
+            capture,
+            npackets=4,
+            nlengths=4,
+            payload_bytes=12,
+            representation="v3",
+            max_bursts=4,
+        )
+    )
+    assert flow.payload_tokens.shape == (4, 12)
+    assert bytes(flow.payload_tokens[0, : len(first)]) == first
+    assert flow.payload_mask[0, 0]
+    assert not flow.payload_mask[0, len(first)]
+    assert flow.packet_features.shape == (4, 16)
+    assert flow.packet_features[0, 0] == 1.0
+    assert flow.packet_features[2, 0] == -1.0
+    assert flow.packet_features[0, 8 + 4] == 1.0  # TCP ACK flag
+    assert flow.burst_mask.tolist() == [True, True, False, False]
+    assert flow.burst_features[0, 0] == 1.0
+    assert flow.burst_features[1, 0] == -1.0
+
+
 def test_multicast_background_reason_is_detected():
     background_filter = BackgroundFlowFilter()
     reason = background_filter.reason(

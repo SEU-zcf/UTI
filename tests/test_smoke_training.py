@@ -164,3 +164,129 @@ evaluation:
         set(class_thresholds) == {"subprototype_1", "subprototype_2"}
         for class_thresholds in subprototype_metrics["thresholds"].values()
     )
+
+
+def _write_v3_manifest(root: Path):
+    rng = np.random.default_rng(7)
+    shards = []
+    shard_index = 0
+    for label, captures in ((1, 3), (2, 3), (3, 2)):
+        for capture_index in range(captures):
+            shard = root / "shards" / f"capture_{shard_index}"
+            shard.mkdir(parents=True)
+            count = 4
+            packet_mask = np.ones((count, 3), dtype=np.bool_)
+            arrays = {
+                "payload_tokens": rng.integers(0, 256, (count, 3, 8), dtype=np.uint8),
+                "payload_mask": np.ones((count, 3, 8), dtype=np.bool_),
+                "packet_features": rng.random((count, 3, 16), dtype=np.float32),
+                "packet_mask": packet_mask,
+                "burst_features": rng.random((count, 2, 8), dtype=np.float32),
+                "burst_mask": np.ones((count, 2), dtype=np.bool_),
+                "labels": np.full(count, label, dtype=np.int64),
+            }
+            paths = {}
+            for name, array in arrays.items():
+                path = shard / f"{name}.npy"
+                np.save(path, array)
+                paths[name] = path.relative_to(root).as_posix()
+            shards.append(
+                {
+                    "id": f"capture_{shard_index}",
+                    "capture": f"class_{label}/capture_{capture_index}.pcap",
+                    "label": label,
+                    "count": count,
+                    **paths,
+                }
+            )
+            shard_index += 1
+    manifest = {
+        "version": 2,
+        "representation": "uti_mpc_v3",
+        "shards": shards,
+        "total_samples": sum(int(shard["count"]) for shard in shards),
+    }
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_v3_one_epoch_grouped_train_and_evaluate(tmp_path: Path):
+    cache = tmp_path / "v3_cache"
+    output = tmp_path / "v3_output"
+    cache.mkdir()
+    _write_v3_manifest(cache)
+    config = tmp_path / "v3_smoke.yaml"
+    config.write_text(
+        f"""
+data:
+  cache_dir: {cache}
+  flow_length_bucket_edges: [1, 2, 8]
+model:
+  name: uti_mpc_v3
+  payload_bytes: 8
+  max_packets: 3
+  max_bursts: 2
+  byte_embedding_dim: 4
+  packet_dim: 8
+  packet_heads: 2
+  packet_layers: 1
+  burst_dim: 8
+  burst_heads: 2
+  burst_layers: 1
+  embedding_dim: 4
+  subprototypes_per_class: 2
+  dropout: 0.0
+split:
+  known_classes: [1, 2]
+  unknown_classes: [3]
+  group_by_capture: true
+  test_fraction: 0.2
+  validation_fraction_of_development: 0.1
+loss:
+  lambda_contrastive: 1.0
+  lambda_reconstruction: 0.1
+  lambda_prototype: 1.0
+  lambda_compact: 0.5
+  lambda_separation: 0.1
+  lambda_overlap: 0.1
+  lambda_radius: 0.01
+  lambda_diversity: 0.01
+  lambda_pseudo_unknown: 0.1
+train:
+  output_dir: {output}
+  seed: 42
+  device: cpu
+  amp: none
+  deterministic: true
+  compile: false
+  epochs: 1
+  stage1_epochs: 0
+  classes_per_batch: 2
+  samples_per_class: 2
+  batches_per_epoch: 1
+  learning_rate: 0.001
+  weight_decay: 0.0
+  warmup_epochs: 0
+  gradient_clip: 1.0
+  evaluate_every: 1
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  augmentation:
+    packet_drop: 0.0
+    payload_mask_fraction: 0.0
+    stats_mask_fraction: 0.5
+    iat_jitter: 0.0
+evaluation:
+  batch_size: 8
+  coverage: 0.95
+  minimum_subprototype_samples: 1
+  minimum_class_samples: 1
+""",
+        encoding="utf-8",
+    )
+    checkpoint = train(config)
+    metrics = evaluate(config, checkpoint)
+    assert checkpoint.exists()
+    assert {"AUROC", "OSCR", "known_macro_F1", "open_macro_F1"}.issubset(metrics)
+    assert (output / "evaluation" / "open_set_artifacts.pt").exists()
+    assert (output / "evaluation" / "capture_metrics.csv").exists()

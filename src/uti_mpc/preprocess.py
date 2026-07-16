@@ -40,6 +40,9 @@ def preprocess(
         raise FileNotFoundError(f"No .pcap or .pcapng files found under {root}")
     resolver = LabelResolver(root, label_map)
     data_config = config["data"]
+    representation = str(data_config.get("representation", "legacy")).lower()
+    if representation not in {"legacy", "v3"}:
+        raise ValueError("data.representation must be 'legacy' or 'v3'")
     temporal_mode = str(data_config.get("temporal_mode", "signed_length"))
     if temporal_mode not in {"signed_length", "rich"}:
         raise ValueError("data.temporal_mode must be 'signed_length' or 'rich'")
@@ -47,11 +50,13 @@ def preprocess(
     byte_width = int(data_config.get("byte_width", 32))
     iat_clip = float(data_config.get("iat_clip", 60.0))
     temporal_features = 13 if temporal_mode == "rich" else 1
+    max_bursts = int(data_config.get("max_bursts", 32))
     background_filter = BackgroundFlowFilter.from_config(
         data_config.get("background_filter", {})
     )
     manifest: dict = {
         "version": 2,
+        "representation": "uti_mpc_v3" if representation == "v3" else "legacy",
         "dataset": "ISCXVPN2016",
         "source_root": str(root),
         "class_map": {str(key): value for key, value in ISCXVPN2016_CLASSES.items()},
@@ -66,6 +71,9 @@ def preprocess(
             "temporal_mode": temporal_mode,
             "temporal_features": temporal_features,
             "iat_clip": iat_clip,
+            "max_bursts": max_bursts if representation == "v3" else None,
+            "packet_features": 16 if representation == "v3" else None,
+            "burst_features": 8 if representation == "v3" else None,
             "background_filter": (
                 background_filter.to_dict() if background_filter is not None else {"enabled": False}
             ),
@@ -91,6 +99,8 @@ def preprocess(
                 byte_width=byte_width,
                 rich_temporal_features=temporal_mode == "rich",
                 iat_clip=iat_clip,
+                representation=representation,
+                max_bursts=max_bursts,
             )
         )
         if capture_audit is not None:
@@ -108,13 +118,24 @@ def preprocess(
         shard_id = f"{capture_index:05d}_{_safe_stem(capture)}"
         shard_dir = destination / "shards" / shard_id
         shard_dir.mkdir(parents=True, exist_ok=True)
-        arrays = {
-            "byte_tokens": np.stack([flow.byte_tokens for flow in flows]),
-            "byte_mask": np.stack([flow.byte_mask for flow in flows]),
-            "length_direction": np.stack([flow.length_direction for flow in flows]),
-            "length_mask": np.stack([flow.length_mask for flow in flows]),
-            "labels": np.full(len(flows), label, dtype=np.int64),
-        }
+        if representation == "v3":
+            arrays = {
+                "payload_tokens": np.stack([flow.payload_tokens for flow in flows]),
+                "payload_mask": np.stack([flow.payload_mask for flow in flows]),
+                "packet_features": np.stack([flow.packet_features for flow in flows]),
+                "packet_mask": np.stack([flow.packet_mask for flow in flows]),
+                "burst_features": np.stack([flow.burst_features for flow in flows]),
+                "burst_mask": np.stack([flow.burst_mask for flow in flows]),
+                "labels": np.full(len(flows), label, dtype=np.int64),
+            }
+        else:
+            arrays = {
+                "byte_tokens": np.stack([flow.byte_tokens for flow in flows]),
+                "byte_mask": np.stack([flow.byte_mask for flow in flows]),
+                "length_direction": np.stack([flow.length_direction for flow in flows]),
+                "length_mask": np.stack([flow.length_mask for flow in flows]),
+                "labels": np.full(len(flows), label, dtype=np.int64),
+            }
         paths: dict[str, str] = {}
         for name, array in arrays.items():
             array_path = shard_dir / f"{name}.npy"

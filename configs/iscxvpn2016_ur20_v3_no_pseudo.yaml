@@ -1,0 +1,8 @@
+extends: iscxvpn2016_ur20_v3.yaml
+
+loss:
+  lambda_pseudo_unknown: 0.0
+
+train:
+  output_dir: outputs/iscxvpn2016_ur20_v3_no_pseudo
+

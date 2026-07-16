@@ -3,7 +3,9 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from uti_mpc.losses import ProtoMarginLoss
-from uti_mpc.models import UTIMPC
+from uti_mpc.data.augmentation import make_v3_view
+from uti_mpc.losses import InformationGeometryBoundaryLoss
+from uti_mpc.models import UTIMPC, UTIMPCV3, predict_v3
 
 
 def _model():
@@ -134,3 +136,74 @@ def test_subcenter_loss_and_ema_weighting_are_finite_and_trainable():
     assert "weight_intra" in losses
     losses["total"].backward()
     assert criterion.subcenters.centers.grad is not None
+
+
+def _v3_model():
+    return UTIMPCV3(
+        {
+            "payload_bytes": 12,
+            "max_packets": 4,
+            "max_bursts": 3,
+            "byte_embedding_dim": 8,
+            "packet_dim": 24,
+            "packet_heads": 4,
+            "packet_layers": 1,
+            "burst_dim": 16,
+            "burst_heads": 4,
+            "burst_layers": 1,
+            "embedding_dim": 8,
+            "subprototypes_per_class": 2,
+            "dropout": 0.0,
+        },
+        [1, 2],
+    )
+
+
+def test_v3_model_geometry_augmentation_and_formal_loss():
+    model = _v3_model()
+    batch = {
+        "payload_tokens": torch.randint(0, 256, (4, 4, 12)),
+        "payload_mask": torch.ones(4, 4, 12, dtype=torch.bool),
+        "packet_features": torch.rand(4, 4, 16),
+        "packet_mask": torch.ones(4, 4, dtype=torch.bool),
+        "burst_features": torch.rand(4, 3, 8),
+        "burst_mask": torch.ones(4, 3, dtype=torch.bool),
+    }
+    first = make_v3_view(batch, packet_drop=0.2)
+    second = make_v3_view(batch, packet_drop=0.2)
+    input_keys = (
+        "payload_tokens",
+        "payload_mask",
+        "packet_features",
+        "packet_mask",
+        "burst_features",
+        "burst_mask",
+    )
+    first_embedding, first_details = model(
+        **{key: first[key] for key in input_keys}, return_details=True
+    )
+    second_embedding, second_details = model(
+        **{key: second[key] for key in input_keys}, return_details=True
+    )
+    assert torch.allclose(first_embedding.norm(dim=1), torch.ones(4), atol=1e-5)
+    labels = torch.tensor([1, 1, 2, 2])
+    model.geometry.initialize_from_embeddings(first_embedding.detach(), labels)
+    criterion = InformationGeometryBoundaryLoss(model.geometry, {})
+    losses = criterion(
+        first_embedding,
+        second_embedding,
+        labels,
+        first_details,
+        second_details,
+        first["reconstruction_target"],
+        second["reconstruction_target"],
+        first["reconstruction_mask"],
+        second["reconstruction_mask"],
+        "formal",
+    )
+    assert torch.isfinite(losses["total"])
+    losses["total"].backward()
+    assert model.geometry.prototypes.grad is not None
+    prediction = predict_v3(model, first_embedding.detach())
+    assert prediction["normalized_scores"].shape == (4,)
+    assert torch.all(model.geometry.radii() > 0)

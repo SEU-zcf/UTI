@@ -1,0 +1,72 @@
+extends: iscxvpn2016_ur20_sanitized.yaml
+
+data:
+  cache_dir: data/processed/iscxvpn2016_v3
+  representation: v3
+  np: 64
+  nl: 64
+  payload_bytes: 96
+  max_bursts: 32
+  iat_clip: 60.0
+
+model:
+  name: uti_mpc_v3
+  payload_bytes: 96
+  max_packets: 64
+  max_bursts: 32
+  byte_embedding_dim: 32
+  packet_dim: 192
+  packet_heads: 6
+  packet_layers: 4
+  burst_dim: 128
+  burst_heads: 4
+  burst_layers: 2
+  embedding_dim: 128
+  subprototypes_per_class: 3
+  minimum_radius: 0.03
+  maximum_radius: 0.8
+  dropout: 0.1
+
+split:
+  group_by_capture: true
+
+loss:
+  contrastive_temperature: 0.1
+  softmin_temperature: 0.05
+  inter_prototype_margin: 0.35
+  boundary_gap: 0.05
+  subprototype_diversity_margin: 0.08
+  pseudo_unknown_margin: 0.15
+  lambda_contrastive: 1.0
+  lambda_reconstruction: 0.1
+  lambda_prototype: 1.0
+  lambda_compact: 0.5
+  lambda_separation: 0.2
+  lambda_overlap: 0.2
+  lambda_radius: 0.05
+  lambda_diversity: 0.05
+  lambda_pseudo_unknown: 0.5
+
+train:
+  output_dir: outputs/iscxvpn2016_ur20_v3_seed42
+  seed: 42
+  epochs: 100
+  stage1_epochs: 10
+  classes_per_batch: 8
+  samples_per_class: 16
+  batches_per_epoch: 64
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  compile: false
+  augmentation:
+    packet_drop: 0.1
+    payload_mask_fraction: 0.1
+    stats_mask_fraction: 0.15
+    iat_jitter: 0.02
+
+evaluation:
+  batch_size: 256
+  coverage: 0.95
+  minimum_subprototype_samples: 10
+  minimum_class_samples: 20

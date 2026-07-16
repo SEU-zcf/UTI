@@ -22,16 +22,18 @@ from uti_mpc.metrics.open_set import (
     calibrate_auxiliary_rejection,
     calibrate_open_set,
     calibrate_subprototype_open_set,
+    calibrate_v3_radii,
     class_conditional_knn_scores,
     class_distance_diagnostics,
     compute_open_set_metrics,
+    compute_continuous_open_set_metrics,
     confusion_matrix,
     predict_open_set,
     prototype_distance_ratios,
     raw_confusion_matrix,
     squared_distances,
 )
-from uti_mpc.models import UTIMPC
+from uti_mpc.models import UTIMPCV3, build_model, predict_v3
 from uti_mpc.utils import atomic_torch_save, choose_amp_dtype, seed_everything, select_single_device
 
 
@@ -120,6 +122,187 @@ def _capture_prediction_breakdown(
     return captures, rows
 
 
+def _evaluate_v3(
+    config: dict,
+    checkpoint_path: str | Path,
+    model: UTIMPCV3,
+    loaders: dict,
+    split,
+    dataset,
+    output_dir: Path,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+) -> dict:
+    if not bool(model.geometry.initialized):
+        raise ValueError("V3 checkpoint geometry has not been initialized")
+    validation_features, validation_labels, _, _ = extract_embeddings(
+        model, loaders["validation"], device, amp_dtype
+    )
+    test_features, test_labels, flow_ids, packet_counts = extract_embeddings(
+        model, loaders["test"], device, amp_dtype
+    )
+    evaluation = config["evaluation"]
+    calibration = calibrate_v3_radii(
+        model,
+        validation_features,
+        validation_labels,
+        coverage=float(evaluation.get("coverage", 0.95)),
+        minimum_subprototype_samples=int(
+            evaluation.get("minimum_subprototype_samples", 10)
+        ),
+        minimum_class_samples=int(evaluation.get("minimum_class_samples", 20)),
+    )
+    result = predict_v3(
+        model,
+        test_features.to(device),
+        calibrated_radii=calibration["radii"],
+    )
+    predictions = result["predictions"].cpu()
+    nearest_classes = result["nearest_classes"].cpu()
+    unknown_scores = result["normalized_scores"].cpu()
+    metrics = {
+        **compute_open_set_metrics(test_labels, predictions, split.known_classes),
+        **compute_continuous_open_set_metrics(
+            test_labels,
+            predictions,
+            unknown_scores,
+            split.known_classes,
+        ),
+    }
+    captures_by_shard = {
+        str(shard["id"]): str(shard.get("capture", shard["id"]))
+        for shard in dataset.shards
+    }
+    captures = []
+    for flow_id in flow_ids:
+        shard_id, separator, _ = flow_id.rpartition(":")
+        if not separator or shard_id not in captures_by_shard:
+            raise RuntimeError(f"Cannot resolve source capture for flow ID: {flow_id}")
+        captures.append(captures_by_shard[shard_id])
+    capture_rows = []
+    known = set(int(value) for value in split.known_classes)
+    for capture in sorted(set(captures)):
+        selected = torch.tensor([value == capture for value in captures], dtype=torch.bool)
+        capture_targets = test_labels[selected]
+        capture_predictions = predictions[selected]
+        grouped_targets = torch.tensor(
+            [int(value) if int(value) in known else -1 for value in capture_targets]
+        )
+        capture_metrics = compute_open_set_metrics(
+            capture_targets, capture_predictions, split.known_classes
+        )
+        capture_rows.append(
+            {
+                "capture": capture,
+                "count": int(selected.sum()),
+                "open_accuracy": float(
+                    (grouped_targets == capture_predictions).float().mean()
+                ),
+                "KCA": capture_metrics["KCA"],
+                "UDR": capture_metrics["UDR"],
+            }
+        )
+    metrics["capture_macro_open_accuracy"] = (
+        sum(float(row["open_accuracy"]) for row in capture_rows) / len(capture_rows)
+        if capture_rows
+        else 0.0
+    )
+    metrics["checkpoint"] = str(Path(checkpoint_path).resolve())
+    metrics["known_classes"] = list(split.known_classes)
+    metrics["unknown_classes"] = list(split.unknown_classes)
+    metrics["coverage"] = float(calibration["coverage"])
+    metrics["thresholds"] = {
+        str(int(label)): {
+            f"subprototype_{index + 1}": float(radius)
+            for index, radius in enumerate(row)
+        }
+        for label, row in zip(
+            model.geometry.classes.cpu(), calibration["radii"], strict=True
+        )
+    }
+    source_names = {0: "learned_radius", 1: "subprototype_validation", 2: "class_validation"}
+    metrics["calibration"] = {
+        str(int(label)): {
+            f"subprototype_{index + 1}": {
+                "source": source_names[int(calibration["source_codes"][class_index, index])],
+                "samples": int(calibration["sample_counts"][class_index, index]),
+            }
+            for index in range(model.geometry.subprototypes)
+        }
+        for class_index, label in enumerate(model.geometry.classes.cpu())
+    }
+    result_dir = output_dir / "evaluation"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    artifacts = {
+        **calibration,
+        "classes": model.geometry.classes.cpu(),
+        "prototypes": model.geometry.normalized_prototypes().detach().cpu(),
+    }
+    atomic_torch_save(artifacts, result_dir / "open_set_artifacts.pt")
+    matrix, order = confusion_matrix(test_labels, predictions, split.known_classes)
+    with (result_dir / "confusion_matrix.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["target/prediction", *order])
+        for label, row in zip(order, matrix.tolist(), strict=True):
+            writer.writerow([label, *row])
+    with (result_dir / "capture_metrics.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=["capture", "count", "open_accuracy", "KCA", "UDR"]
+        )
+        writer.writeheader()
+        writer.writerows(capture_rows)
+    radii = calibration["radii"]
+    learned_radii = calibration["learned_radii"]
+    with (result_dir / "predictions.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "flow_id",
+                "capture",
+                "packet_count",
+                "target",
+                "prediction",
+                "nearest_class",
+                "subprototype",
+                "cosine_distance",
+                "learned_radius",
+                "calibrated_radius",
+                "normalized_score",
+                "second_class_gap",
+            ]
+        )
+        for index in range(len(flow_ids)):
+            class_position = int(result["class_positions"][index])
+            prototype_position = int(result["prototype_positions"][index])
+            writer.writerow(
+                [
+                    flow_ids[index],
+                    captures[index],
+                    int(packet_counts[index]),
+                    int(test_labels[index]),
+                    int(predictions[index]),
+                    int(nearest_classes[index]),
+                    prototype_position + 1,
+                    float(result["distances"][index]),
+                    float(learned_radii[class_position, prototype_position]),
+                    float(radii[class_position, prototype_position]),
+                    float(unknown_scores[index]),
+                    float(result["second_class_gap"][index]),
+                ]
+            )
+    serializable = json.loads(json.dumps(metrics))
+    with (result_dir / "metrics.json").open("w", encoding="utf-8") as handle:
+        json.dump(serializable, handle, ensure_ascii=False, indent=2)
+    print(json.dumps(serializable, indent=2, ensure_ascii=False))
+    return serializable
+
+
 def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
     config = load_config(config_path)
     seed_everything(int(config["train"].get("seed", 42)), True)
@@ -129,9 +312,21 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
     amp_dtype = choose_amp_dtype(device, str(config["train"].get("amp", "bf16")))
     dataset, split, _ = load_dataset_and_split(config, output_dir)
     loaders = build_loaders(dataset, split, config)
-    model = UTIMPC(config["model"]).to(device)
+    model = build_model(config["model"], config["split"]["known_classes"]).to(device)
     checkpoint = load_checkpoint(checkpoint_path, device)
     model.load_state_dict(checkpoint["model"])
+    if isinstance(model, UTIMPCV3):
+        return _evaluate_v3(
+            config,
+            checkpoint_path,
+            model,
+            loaders,
+            split,
+            dataset,
+            output_dir,
+            device,
+            amp_dtype,
+        )
     train_features, train_labels, _, train_packet_counts = extract_embeddings(
         model, loaders["train_eval"], device, amp_dtype
     )

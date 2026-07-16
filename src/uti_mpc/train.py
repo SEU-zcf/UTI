@@ -13,12 +13,13 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 
 from uti_mpc.config import load_config, require_keys, save_config
+from uti_mpc.data.augmentation import make_v3_view
 from uti_mpc.engine.checkpoint import load_checkpoint, restore_rng_state, save_checkpoint
-from uti_mpc.engine.features import extract_embeddings
+from uti_mpc.engine.features import extract_embeddings, move_v3_inputs
 from uti_mpc.engine.runtime import build_loaders, load_dataset_and_split
-from uti_mpc.losses import ProtoMarginLoss
+from uti_mpc.losses import InformationGeometryBoundaryLoss, ProtoMarginLoss
 from uti_mpc.metrics.open_set import compute_prototypes, squared_distances
-from uti_mpc.models import UTIMPC
+from uti_mpc.models import UTIMPCV3, build_model, predict_v3
 from uti_mpc.utils import (
     append_jsonl,
     choose_amp_dtype,
@@ -73,9 +74,20 @@ def _known_validation_accuracy(
     validation_features, validation_labels, _, _ = extract_embeddings(
         model, loaders["validation"], device, amp_dtype
     )
-    prototypes, classes = compute_prototypes(train_features, train_labels, known_classes)
-    predicted = classes[squared_distances(validation_features, prototypes).argmin(dim=1)]
-    return float((predicted == validation_labels).float().mean())
+    if isinstance(model, UTIMPCV3) and bool(model.geometry.initialized):
+        result = predict_v3(
+            model,
+            validation_features.to(device),
+        )
+        predicted = result["predictions"].cpu()
+    else:
+        prototypes, classes = compute_prototypes(train_features, train_labels, known_classes)
+        predicted = classes[squared_distances(validation_features, prototypes).argmin(dim=1)]
+    class_scores = []
+    for label in torch.unique(validation_labels):
+        selected = validation_labels == label
+        class_scores.append((predicted[selected] == validation_labels[selected]).float().mean())
+    return float(torch.stack(class_scores).mean()) if class_scores else 0.0
 
 
 def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
@@ -102,29 +114,36 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
     )
     dataset, split, split_path = load_dataset_and_split(config, output_dir)
     loaders = build_loaders(dataset, split, config)
-    raw_model = UTIMPC(config["model"]).to(device)
+    raw_model = build_model(config["model"], config["split"]["known_classes"]).to(device)
     model: torch.nn.Module = raw_model
     if bool(config["train"].get("compile", False)):
         model = torch.compile(raw_model)
-    criterion = ProtoMarginLoss(
-        triplet_margin=float(config["loss"]["triplet_margin"]),
-        prototype_margin=float(config["loss"]["prototype_margin"]),
-        lambda_intra=float(config["loss"]["lambda_intra"]),
-        lambda_inter=float(config["loss"]["lambda_inter"]),
-        known_classes=list(config["split"]["known_classes"]),
-        embedding_dim=int(config["model"].get("embedding_dim", 128)),
-        lambda_arcface=float(config["loss"].get("lambda_arcface", 0.0)),
-        arcface_scale=float(config["loss"].get("arcface_scale", 30.0)),
-        arcface_margin=float(config["loss"].get("arcface_margin", 0.2)),
-        subcenters_per_class=int(config["loss"].get("subcenters_per_class", 1)),
-        lambda_diversity=float(config["loss"].get("lambda_diversity", 0.0)),
-        subcenter_diversity_margin=float(
-            config["loss"].get("subcenter_diversity_margin", 0.2)
-        ),
-        loss_weighting=str(config["loss"].get("loss_weighting", "fixed")),
-        loss_ema_decay=float(config["loss"].get("loss_ema_decay", 0.95)),
-    ).to(device)
-    trainable_parameters = [*raw_model.parameters(), *criterion.parameters()]
+    if isinstance(raw_model, UTIMPCV3):
+        criterion = InformationGeometryBoundaryLoss(
+            raw_model.geometry, config["loss"]
+        ).to(device)
+    else:
+        criterion = ProtoMarginLoss(
+            triplet_margin=float(config["loss"]["triplet_margin"]),
+            prototype_margin=float(config["loss"]["prototype_margin"]),
+            lambda_intra=float(config["loss"]["lambda_intra"]),
+            lambda_inter=float(config["loss"]["lambda_inter"]),
+            known_classes=list(config["split"]["known_classes"]),
+            embedding_dim=int(config["model"].get("embedding_dim", 128)),
+            lambda_arcface=float(config["loss"].get("lambda_arcface", 0.0)),
+            arcface_scale=float(config["loss"].get("arcface_scale", 30.0)),
+            arcface_margin=float(config["loss"].get("arcface_margin", 0.2)),
+            subcenters_per_class=int(config["loss"].get("subcenters_per_class", 1)),
+            lambda_diversity=float(config["loss"].get("lambda_diversity", 0.0)),
+            subcenter_diversity_margin=float(
+                config["loss"].get("subcenter_diversity_margin", 0.2)
+            ),
+            loss_weighting=str(config["loss"].get("loss_weighting", "fixed")),
+            loss_ema_decay=float(config["loss"].get("loss_ema_decay", 0.95)),
+        ).to(device)
+    trainable_parameters = list(raw_model.parameters())
+    if not isinstance(raw_model, UTIMPCV3):
+        trainable_parameters.extend(criterion.parameters())
     optimizer = AdamW(
         trainable_parameters,
         lr=float(config["train"]["learning_rate"]),
@@ -146,7 +165,7 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
         raw_model.load_state_dict(checkpoint["model"])
         if "criterion" in checkpoint:
             criterion.load_state_dict(checkpoint["criterion"])
-        elif criterion.arcface is not None:
+        elif getattr(criterion, "arcface", None) is not None:
             raise ValueError("ArcFace checkpoint is missing the criterion state")
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -160,6 +179,18 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
     stage1_epochs = int(config["train"]["stage1_epochs"])
     gradient_clip = float(config["train"].get("gradient_clip", 1.0))
     for epoch in range(start_epoch, epochs):
+        if (
+            isinstance(raw_model, UTIMPCV3)
+            and epoch >= stage1_epochs
+            and not bool(raw_model.geometry.initialized)
+        ):
+            initialization_features, initialization_labels, _, _ = extract_embeddings(
+                model, loaders["train_eval"], device, amp_dtype
+            )
+            raw_model.geometry.initialize_from_embeddings(
+                initialization_features, initialization_labels
+            )
+            print(f"initialized V3 geometry at epoch={epoch}")
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         epoch_start = time.time()
@@ -174,13 +205,39 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
             optimizer.zero_grad(set_to_none=True)
             labels = batch["label"].to(device, non_blocking=True)
             with _autocast(device, amp_dtype):
-                embeddings = model(
-                    batch["byte_tokens"].to(device, non_blocking=True),
-                    batch["length_direction"].to(device, non_blocking=True),
-                    batch["byte_mask"].to(device, non_blocking=True),
-                    batch["length_mask"].to(device, non_blocking=True),
-                )
-                losses = criterion(embeddings, labels, stage)
+                if isinstance(raw_model, UTIMPCV3):
+                    base_inputs = move_v3_inputs(batch, device)
+                    augmentation = config["train"].get("augmentation", {})
+                    first_view = make_v3_view(base_inputs, **augmentation)
+                    second_view = make_v3_view(base_inputs, **augmentation)
+                    first_embedding, first_details = model(
+                        **{key: first_view[key] for key in base_inputs},
+                        return_details=True,
+                    )
+                    second_embedding, second_details = model(
+                        **{key: second_view[key] for key in base_inputs},
+                        return_details=True,
+                    )
+                    losses = criterion(
+                        first_embedding,
+                        second_embedding,
+                        labels,
+                        first_details,
+                        second_details,
+                        first_view["reconstruction_target"],
+                        second_view["reconstruction_target"],
+                        first_view["reconstruction_mask"],
+                        second_view["reconstruction_mask"],
+                        stage,
+                    )
+                else:
+                    embeddings = model(
+                        batch["byte_tokens"].to(device, non_blocking=True),
+                        batch["length_direction"].to(device, non_blocking=True),
+                        batch["byte_mask"].to(device, non_blocking=True),
+                        batch["length_mask"].to(device, non_blocking=True),
+                    )
+                    losses = criterion(embeddings, labels, stage)
             if totals is None:
                 totals = {key: 0.0 for key in losses}
             if not torch.isfinite(losses["total"]):
@@ -229,7 +286,8 @@ def train(config_path: str | Path, resume: str | Path | None = None) -> Path:
                 amp_dtype,
             )
             record["known_validation_accuracy"] = validation_accuracy
-            if validation_accuracy > best_validation:
+            eligible_for_best = not isinstance(raw_model, UTIMPCV3) or stage == "formal"
+            if eligible_for_best and validation_accuracy > best_validation:
                 best_validation = validation_accuracy
                 payload = _checkpoint_payload(
                     raw_model,

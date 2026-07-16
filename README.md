@@ -222,6 +222,45 @@ both cache and checkpoints to different paths. Treat it as an ablation: those
 extra flows contain very few packets/bytes and inherit capture-level labels,
 so its headline accuracy is not directly comparable to the sanitized result.
 
+### UTI-MPC V3 information–geometry–boundary model
+
+V3 is an independent open-set pipeline. It removes endpoint and volatile header
+fingerprints from model inputs, stores masked application-payload bytes plus
+packet/burst statistics, and uses capture-disjoint train/validation/test splits.
+Its inference head is a union of learned hyperspherical subprototype regions;
+each region has its own trainable and known-only calibrated radius. Real unknown
+classes are never used for training, checkpoint selection, or calibration.
+
+Create the separate V3 cache and run UR20:
+
+```bash
+python -m uti_mpc.preprocess \
+  --config configs/iscxvpn2016_ur20_v3.yaml \
+  --pcap-root /path/to/ISCX-VPN-NonVPN-2016
+
+CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.train \
+  --config configs/iscxvpn2016_ur20_v3.yaml
+
+CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.evaluate \
+  --config configs/iscxvpn2016_ur20_v3.yaml \
+  --checkpoint outputs/iscxvpn2016_ur20_v3_seed42/best.pt
+```
+
+Run the three configured seeds sequentially on one selected GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.benchmark \
+  --configs \
+    configs/iscxvpn2016_ur20_v3.yaml \
+    configs/iscxvpn2016_ur20_v3_seed43.yaml \
+    configs/iscxvpn2016_ur20_v3_seed44.yaml
+```
+
+V3 additionally reports AUROC, AUPR-Out, FPR95, OSCR, known/open macro-F1,
+capture-macro accuracy, learned/calibrated radii, and a continuous unknown score
+for every flow. Existing V1/V2 caches, configurations, and checkpoints remain
+supported.
+
 ### Flow-length conditional experiments
 
 The `*_length_conditional.yaml` configurations retain every short flow. They

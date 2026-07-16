@@ -4,9 +4,179 @@ from typing import Any, Sequence
 
 import torch
 
+from uti_mpc.models.uti_mpc_v3 import UTIMPCV3, predict_v3
+
 
 def squared_distances(features: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
     return torch.cdist(features.float(), prototypes.float(), p=2).square()
+
+
+def _finite_sample_quantile(values: torch.Tensor, coverage: float) -> torch.Tensor:
+    if len(values) == 0:
+        raise ValueError("Conformal quantile requires at least one value")
+    if not 0.0 < coverage < 1.0:
+        raise ValueError("coverage must be between zero and one")
+    rank = min(len(values), max(1, int(__import__("math").ceil((len(values) + 1) * coverage))))
+    return values.float().sort().values[rank - 1]
+
+
+@torch.no_grad()
+def calibrate_v3_radii(
+    model: UTIMPCV3,
+    validation_features: torch.Tensor,
+    validation_labels: torch.Tensor,
+    coverage: float = 0.95,
+    minimum_subprototype_samples: int = 10,
+    minimum_class_samples: int = 20,
+) -> dict[str, torch.Tensor]:
+    """Calibrate V3 radii using known validation samples only.
+
+    Source codes are 1=subprototype, 2=class fallback, 0=learned-radius fallback.
+    """
+    device = model.geometry.prototypes.device
+    features = validation_features.float().to(device)
+    labels = validation_labels.to(device)
+    learned = model.geometry.radii().detach()
+    calibrated = learned.clone()
+    counts = torch.zeros_like(learned, dtype=torch.long)
+    source_codes = torch.zeros_like(learned, dtype=torch.long)
+    if len(features) == 0:
+        return {
+            "radii": calibrated.cpu(),
+            "learned_radii": learned.cpu(),
+            "sample_counts": counts.cpu(),
+            "source_codes": source_codes.cpu(),
+            "coverage": torch.tensor(coverage),
+        }
+    distances = model.geometry.distances(features)
+    result = predict_v3(model, features)
+    nearest_classes = result["nearest_classes"]
+    for class_position, label in enumerate(model.geometry.classes):
+        correct = (labels == label) & (nearest_classes == label)
+        own = distances[:, class_position]
+        assignments = (own / learned[class_position].unsqueeze(0)).argmin(dim=1)
+        class_values = own[correct].gather(
+            1, assignments[correct, None]
+        ).squeeze(1)
+        class_scale = None
+        if len(class_values) >= minimum_class_samples:
+            class_ratios = class_values / learned[class_position][assignments[correct]]
+            class_scale = _finite_sample_quantile(class_ratios, coverage)
+        for prototype in range(model.geometry.subprototypes):
+            selected = own[correct & (assignments == prototype), prototype]
+            counts[class_position, prototype] = len(selected)
+            if len(selected) >= minimum_subprototype_samples:
+                calibrated[class_position, prototype] = _finite_sample_quantile(
+                    selected, coverage
+                ).clamp(model.geometry.min_radius, model.geometry.max_radius)
+                source_codes[class_position, prototype] = 1
+            elif class_scale is not None:
+                calibrated[class_position, prototype] = (
+                    learned[class_position, prototype] * class_scale
+                ).clamp(model.geometry.min_radius, model.geometry.max_radius)
+                source_codes[class_position, prototype] = 2
+    return {
+        "radii": calibrated.cpu(),
+        "learned_radii": learned.cpu(),
+        "sample_counts": counts.cpu(),
+        "source_codes": source_codes.cpu(),
+        "coverage": torch.tensor(coverage),
+    }
+
+
+def _binary_curve(
+    scores: torch.Tensor, positives: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    scores = scores.float().cpu()
+    positives = positives.bool().cpu()
+    order = torch.argsort(scores, descending=True)
+    sorted_scores = scores[order]
+    sorted_positive = positives[order]
+    true_positive = sorted_positive.cumsum(0).float()
+    false_positive = (~sorted_positive).cumsum(0).float()
+    positive_count = max(int(positives.sum()), 1)
+    negative_count = max(int((~positives).sum()), 1)
+    distinct = torch.ones(len(scores), dtype=torch.bool)
+    if len(scores) > 1:
+        distinct[:-1] = sorted_scores[:-1] != sorted_scores[1:]
+    return (
+        torch.cat((torch.zeros(1), false_positive[distinct] / negative_count)),
+        torch.cat((torch.zeros(1), true_positive[distinct] / positive_count)),
+        torch.cat((torch.tensor([float("inf")]), sorted_scores[distinct])),
+    )
+
+
+def _macro_f1(
+    targets: torch.Tensor, predictions: torch.Tensor, labels: Sequence[int]
+) -> float:
+    values = []
+    for label in labels:
+        target = targets == int(label)
+        predicted = predictions == int(label)
+        tp = float((target & predicted).sum())
+        fp = float((~target & predicted).sum())
+        fn = float((target & ~predicted).sum())
+        denominator = 2.0 * tp + fp + fn
+        values.append(2.0 * tp / denominator if denominator else 0.0)
+    return sum(values) / len(values) if values else 0.0
+
+
+def compute_continuous_open_set_metrics(
+    targets: torch.Tensor,
+    predictions: torch.Tensor,
+    unknown_scores: torch.Tensor,
+    known_classes: Sequence[int],
+    unknown_label: int = -1,
+) -> dict[str, float]:
+    targets = targets.cpu()
+    predictions = predictions.cpu()
+    unknown_scores = unknown_scores.float().cpu()
+    known_mask = torch.zeros_like(targets, dtype=torch.bool)
+    for label in known_classes:
+        known_mask |= targets == int(label)
+    unknown_mask = ~known_mask
+    fpr, tpr, _ = _binary_curve(unknown_scores, unknown_mask)
+    auroc = float(torch.trapezoid(tpr, fpr)) if unknown_mask.any() and known_mask.any() else 0.0
+    order = torch.argsort(unknown_scores, descending=True)
+    positives = unknown_mask[order]
+    tp = positives.cumsum(0).float()
+    precision = tp / torch.arange(1, len(tp) + 1, dtype=torch.float32)
+    recall = tp / max(int(unknown_mask.sum()), 1)
+    aupr_out = float(
+        torch.trapezoid(
+            torch.cat((torch.ones(1), precision)),
+            torch.cat((torch.zeros(1), recall)),
+        )
+    ) if unknown_mask.any() else 0.0
+    reached = torch.nonzero(tpr >= 0.95, as_tuple=False).flatten()
+    fpr95 = float(fpr[reached[0]]) if len(reached) else 1.0
+
+    thresholds = torch.sort(torch.unique(unknown_scores)).values
+    oscr_fpr = [0.0]
+    oscr_ccr = [0.0]
+    nearest_correct = predictions == targets
+    for threshold in thresholds:
+        accepted = unknown_scores <= threshold
+        oscr_fpr.append(float((unknown_mask & accepted).sum()) / max(int(unknown_mask.sum()), 1))
+        oscr_ccr.append(float((known_mask & accepted & nearest_correct).sum()) / max(int(known_mask.sum()), 1))
+    oscr = float(
+        torch.trapezoid(torch.tensor(oscr_ccr), torch.tensor(oscr_fpr))
+    ) if unknown_mask.any() and known_mask.any() else 0.0
+    grouped_targets = torch.where(
+        known_mask, targets, torch.full_like(targets, unknown_label)
+    )
+    return {
+        "AUROC": auroc,
+        "AUPR_OUT": aupr_out,
+        "FPR95": fpr95,
+        "OSCR": oscr,
+        "known_macro_F1": _macro_f1(targets, predictions, known_classes),
+        "open_macro_F1": _macro_f1(
+            grouped_targets,
+            predictions,
+            [*sorted(int(value) for value in known_classes), unknown_label],
+        ),
+    }
 
 
 def class_conditional_knn_scores(

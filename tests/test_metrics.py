@@ -6,14 +6,17 @@ from uti_mpc.metrics.open_set import (
     calibrate_auxiliary_rejection,
     calibrate_open_set,
     calibrate_subprototype_open_set,
+    calibrate_v3_radii,
     class_conditional_knn_scores,
     class_distance_diagnostics,
     compute_open_set_metrics,
+    compute_continuous_open_set_metrics,
     predict_open_set,
     prototype_distance_ratios,
     raw_confusion_matrix,
     squared_distances,
 )
+from uti_mpc.models import UTIMPCV3
 
 
 def test_calibration_and_open_set_metrics():
@@ -155,3 +158,47 @@ def test_raw_confusion_and_distance_diagnostics_preserve_unknown_classes():
     assert unknown_voip["target"] == 10
     assert unknown_voip["rejected"] == 1
     assert unknown_voip["nearest_prototype_distribution"]["5"] == 2
+
+
+def test_continuous_metrics_and_v3_calibration_fallbacks():
+    targets = torch.tensor([1, 1, 2, 2, 3, 3])
+    predictions = torch.tensor([1, 1, 2, -1, -1, -1])
+    scores = torch.tensor([0.1, 0.2, 0.2, 1.1, 1.5, 1.8])
+    metrics = compute_continuous_open_set_metrics(
+        targets, predictions, scores, [1, 2]
+    )
+    assert metrics["AUROC"] > 0.9
+    assert metrics["OSCR"] > 0.0
+    assert 0.0 <= metrics["open_macro_F1"] <= 1.0
+
+    model = UTIMPCV3(
+        {
+            "payload_bytes": 4,
+            "max_packets": 2,
+            "max_bursts": 2,
+            "byte_embedding_dim": 4,
+            "packet_dim": 8,
+            "packet_heads": 2,
+            "packet_layers": 1,
+            "burst_dim": 8,
+            "burst_heads": 2,
+            "burst_layers": 1,
+            "embedding_dim": 2,
+            "subprototypes_per_class": 2,
+            "dropout": 0.0,
+        },
+        [1, 2],
+    )
+    training = torch.nn.functional.normalize(
+        torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]]), dim=1
+    )
+    model.geometry.initialize_from_embeddings(training, torch.tensor([1, 1, 2, 2]))
+    artifacts = calibrate_v3_radii(
+        model,
+        training[:2],
+        torch.tensor([1, 1]),
+        minimum_subprototype_samples=1,
+        minimum_class_samples=1,
+    )
+    assert artifacts["radii"].shape == (2, 2)
+    assert torch.all(artifacts["source_codes"][1] == 0)

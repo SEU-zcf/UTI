@@ -1,0 +1,6 @@
+extends: iscxvpn2016_ur20_v3.yaml
+
+train:
+  seed: 43
+  output_dir: outputs/iscxvpn2016_ur20_v3_seed43
+

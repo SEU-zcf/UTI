@@ -9,7 +9,11 @@ from torch.utils.data import DataLoader, Subset
 from uti_mpc.data.buckets import packet_counts_to_buckets
 from uti_mpc.data.dataset import TrafficDataset
 from uti_mpc.data.sampler import PKBatchSampler
-from uti_mpc.data.splits import OpenSetSplit, build_open_set_split
+from uti_mpc.data.splits import (
+    OpenSetSplit,
+    build_grouped_open_set_split,
+    build_open_set_split,
+)
 
 
 def load_dataset_and_split(
@@ -25,15 +29,29 @@ def load_dataset_and_split(
         split = OpenSetSplit.load(split_path)
         if split.known_classes != expected_known or split.unknown_classes != expected_unknown:
             raise ValueError(f"Existing split does not match configuration: {split_path}")
+        if split.cache_fingerprint and split.cache_fingerprint != dataset.fingerprint:
+            raise ValueError(f"Existing split was created for a different cache: {split_path}")
+        split.validate_groups()
     else:
-        split = build_open_set_split(
+        split_builder = (
+            build_grouped_open_set_split
+            if bool(split_config.get("group_by_capture", False))
+            else build_open_set_split
+        )
+        split = split_builder(
             dataset.labels(),
+            *((dataset.captures(),) if split_builder is build_grouped_open_set_split else ()),
             expected_known,
             expected_unknown,
             seed=int(config["train"]["seed"]),
             test_fraction=float(split_config.get("test_fraction", 0.2)),
             validation_fraction_of_development=float(
                 split_config.get("validation_fraction_of_development", 0.1)
+            ),
+            **(
+                {"cache_fingerprint": dataset.fingerprint}
+                if split_builder is build_grouped_open_set_split
+                else {}
             ),
         )
         split.save(split_path)
