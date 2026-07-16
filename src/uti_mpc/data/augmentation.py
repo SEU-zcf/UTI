@@ -51,7 +51,7 @@ def make_v3_view(
     if iat_jitter > 0.0:
         noise = torch.randn_like(packet_features[..., 5]) * iat_jitter
         packet_features[..., 5] = torch.where(
-            kept,
+            kept & ~reconstruction_mask,
             (packet_features[..., 5] + noise).clamp(0.0, 1.0),
             packet_features[..., 5],
         )
@@ -71,4 +71,3 @@ def make_v3_view(
         "reconstruction_target": reconstruction_target,
         "reconstruction_mask": reconstruction_mask,
     }
-

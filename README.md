@@ -259,7 +259,8 @@ CUDA_VISIBLE_DEVICES=0 python -m uti_mpc.benchmark \
 V3 additionally reports AUROC, AUPR-Out, FPR95, OSCR, known/open macro-F1,
 capture-macro accuracy, learned/calibrated radii, and a continuous unknown score
 for every flow. Existing V1/V2 caches, configurations, and checkpoints remain
-supported.
+supported. Use `configs/iscxvpn2016_ur20_v2_rich_grouped.yaml` when comparing
+V2-rich with V3 under the same capture-disjoint split protocol.
 
 ### Flow-length conditional experiments
 

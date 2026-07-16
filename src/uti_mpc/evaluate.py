@@ -122,6 +122,7 @@ def _capture_prediction_breakdown(
     return captures, rows
 
 
+@torch.no_grad()
 def _evaluate_v3(
     config: dict,
     checkpoint_path: str | Path,
@@ -167,6 +168,7 @@ def _evaluate_v3(
             predictions,
             unknown_scores,
             split.known_classes,
+            nearest_predictions=nearest_classes,
         ),
     }
     captures_by_shard = {
@@ -439,6 +441,15 @@ def evaluate(config_path: str | Path, checkpoint_path: str | Path) -> dict:
     threshold_ratios = nearest_distances / nearest_thresholds
     metrics = _decision_metrics(
         test_labels, predictions, nearest_classes, split.known_classes
+    )
+    metrics.update(
+        compute_continuous_open_set_metrics(
+            test_labels,
+            predictions,
+            threshold_ratios,
+            split.known_classes,
+            nearest_predictions=nearest_classes,
+        )
     )
     if not torch.allclose(distances, nearest_distances, atol=1e-6, rtol=1e-5):
         raise RuntimeError("Prediction distances do not match nearest prototype distances")

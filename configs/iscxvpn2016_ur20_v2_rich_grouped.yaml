@@ -1,0 +1,9 @@
+extends: iscxvpn2016_ur20_v2_rich.yaml
+
+split:
+  group_by_capture: true
+
+train:
+  seed: 42
+  output_dir: outputs/iscxvpn2016_ur20_v2_rich_grouped
+

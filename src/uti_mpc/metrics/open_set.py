@@ -127,9 +127,15 @@ def compute_continuous_open_set_metrics(
     unknown_scores: torch.Tensor,
     known_classes: Sequence[int],
     unknown_label: int = -1,
+    nearest_predictions: torch.Tensor | None = None,
 ) -> dict[str, float]:
     targets = targets.cpu()
     predictions = predictions.cpu()
+    closed_set_predictions = (
+        predictions
+        if nearest_predictions is None
+        else nearest_predictions.cpu()
+    )
     unknown_scores = unknown_scores.float().cpu()
     known_mask = torch.zeros_like(targets, dtype=torch.bool)
     for label in known_classes:
@@ -154,7 +160,7 @@ def compute_continuous_open_set_metrics(
     thresholds = torch.sort(torch.unique(unknown_scores)).values
     oscr_fpr = [0.0]
     oscr_ccr = [0.0]
-    nearest_correct = predictions == targets
+    nearest_correct = closed_set_predictions == targets
     for threshold in thresholds:
         accepted = unknown_scores <= threshold
         oscr_fpr.append(float((unknown_mask & accepted).sum()) / max(int(unknown_mask.sum()), 1))
@@ -170,7 +176,9 @@ def compute_continuous_open_set_metrics(
         "AUPR_OUT": aupr_out,
         "FPR95": fpr95,
         "OSCR": oscr,
-        "known_macro_F1": _macro_f1(targets, predictions, known_classes),
+        "known_macro_F1": _macro_f1(
+            targets[known_mask], predictions[known_mask], known_classes
+        ),
         "open_macro_F1": _macro_f1(
             grouped_targets,
             predictions,

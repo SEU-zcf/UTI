@@ -68,19 +68,20 @@ def _known_validation_accuracy(
     device: torch.device,
     amp_dtype: torch.dtype | None,
 ) -> float:
-    train_features, train_labels, _, _ = extract_embeddings(
-        model, loaders["train_eval"], device, amp_dtype
-    )
+    base_model = getattr(model, "_orig_mod", model)
     validation_features, validation_labels, _, _ = extract_embeddings(
         model, loaders["validation"], device, amp_dtype
     )
-    if isinstance(model, UTIMPCV3) and bool(model.geometry.initialized):
+    if isinstance(base_model, UTIMPCV3) and bool(base_model.geometry.initialized):
         result = predict_v3(
-            model,
+            base_model,
             validation_features.to(device),
         )
         predicted = result["predictions"].cpu()
     else:
+        train_features, train_labels, _, _ = extract_embeddings(
+            model, loaders["train_eval"], device, amp_dtype
+        )
         prototypes, classes = compute_prototypes(train_features, train_labels, known_classes)
         predicted = classes[squared_distances(validation_features, prototypes).argmin(dim=1)]
     class_scores = []
